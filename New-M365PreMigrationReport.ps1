@@ -1,0 +1,832 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Generates a pre-migration assessment report for a Microsoft 365 tenant
+    (tenant-to-tenant scenario) as a multi-tab Excel workbook.
+
+.DESCRIPTION
+    Connects to Microsoft Graph (PowerShell SDK) and inventories the SOURCE
+    tenant across four workloads:
+
+        * Identity & licensing  - users, guests, license SKUs, per-user licenses,
+                                   MFA / auth-method registration
+        * Exchange / mailboxes  - mailbox usage (size, item count, archive)
+        * SharePoint & OneDrive - site storage, per-user OneDrive usage
+        * Teams & Groups        - M365 groups, Teams, owner/member counts
+
+    Each data set is written to its own worksheet, with a "Summary" tab that
+    rolls up the headline numbers a migration team cares about.
+
+    Mailbox / OneDrive / SharePoint sizing comes from the Graph **usage reports**
+    API (getMailboxUsageDetail, getOneDriveUsageAccountDetail,
+    getSharePointSiteUsageDetail). This keeps the whole script on the Graph SDK
+    (no Exchange Online module required).
+
+.PARAMETER OutputPath
+    Folder or full .xlsx path for the report. Defaults to the script folder with
+    a timestamped filename.
+
+.PARAMETER TenantId
+    Optional tenant id / domain to target a specific tenant at sign-in.
+
+.PARAMETER Workload
+    Which workloads to collect. Defaults to all four. Accepts any combination of:
+    Identity, Exchange, SharePoint, Teams.
+
+.PARAMETER UsagePeriod
+    Reporting period for the usage-report data: D7, D30, D90, or D180. Default D30.
+
+.PARAMETER UseAppOnly
+    Use app-only (unattended) auth instead of interactive. Requires -ClientId,
+    -TenantId and either -CertificateThumbprint.
+
+.PARAMETER ClientId
+    App registration (client) id for app-only auth.
+
+.PARAMETER CertificateThumbprint
+    Thumbprint of a cert in the local cert store for app-only auth.
+
+.PARAMETER SkipModuleInstall
+    Don't attempt to install missing modules; fail instead.
+
+.EXAMPLE
+    .\New-M365PreMigrationReport.ps1
+    Interactive sign-in, all workloads, report dropped next to the script.
+
+.EXAMPLE
+    .\New-M365PreMigrationReport.ps1 -OutputPath C:\Reports -Workload Identity,Exchange -UsagePeriod D90
+
+.EXAMPLE
+    .\New-M365PreMigrationReport.ps1 -UseAppOnly -TenantId contoso.onmicrosoft.com `
+        -ClientId 1111-... -CertificateThumbprint ABCD... -OutputPath C:\Reports
+
+.NOTES
+    Required Graph permissions (delegated or application):
+        Organization.Read.All, User.Read.All, Group.Read.All, GroupMember.Read.All,
+        Directory.Read.All, Sites.Read.All, Reports.Read.All,
+        AuditLog.Read.All (auth-method registration report)
+
+    Usage-report user/site names are blank/anonymised if the tenant has
+    "Reports: Display concealed user, group and site names" turned ON in
+    M365 admin center > Settings > Org settings > Reports. Turn it off (or accept
+    GUIDs) before running for full detail.
+#>
+[CmdletBinding()]
+param(
+    [string]$OutputPath,
+
+    [string]$TenantId,
+
+    [ValidateSet('Identity', 'Exchange', 'SharePoint', 'Teams')]
+    [string[]]$Workload = @('Identity', 'Exchange', 'SharePoint', 'Teams'),
+
+    [ValidateSet('D7', 'D30', 'D90', 'D180')]
+    [string]$UsagePeriod = 'D30',
+
+    [switch]$UseAppOnly,
+    [string]$ClientId,
+    [string]$CertificateThumbprint,
+
+    [switch]$SkipModuleInstall,
+
+    # Mailbox type (User/Shared/Room/Equipment) is not available from Graph, so by
+    # default the Exchange workload also connects to Exchange Online PowerShell to
+    # enrich the Mailboxes sheet. Use -SkipMailboxType to stay pure-Graph (no ExO
+    # module / second sign-in); the MailboxType column then reads "Unknown".
+    [switch]$SkipMailboxType,
+
+    # Per-mailbox delegation (FullAccess / SendAs / SendOnBehalf) is collected via
+    # Exchange Online when the Exchange workload runs. It makes a couple of calls
+    # per mailbox, so use -SkipDelegation on very large tenants to skip that sheet.
+    [switch]$SkipDelegation,
+
+    # License friendly-name catalog. By default the script downloads Microsoft's
+    # published "Product names and service plan identifiers" CSV. Use
+    # -OfflineSkuNames to skip the download (built-in map only), or -SkuCatalogPath
+    # to point at a previously saved copy of the CSV (air-gapped runs).
+    [switch]$OfflineSkuNames,
+    [string]$SkuCatalogPath,
+    [string]$SkuCatalogUrl = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
+)
+
+$ErrorActionPreference = 'Stop'
+$script:StartTime = Get-Date
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+function Write-Step {
+    param([string]$Message, [string]$Status = 'INFO')
+    $color = switch ($Status) {
+        'OK'    { 'Green' }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+        default { 'Cyan' }
+    }
+    Write-Host ("[{0:HH:mm:ss}] " -f (Get-Date)) -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-5} " -f $Status) -NoNewline -ForegroundColor $color
+    Write-Host $Message
+}
+
+function Initialize-Module {
+    param([string]$Name, [string]$MinimumVersion)
+    $existing = Get-Module -ListAvailable -Name $Name |
+        Sort-Object Version -Descending | Select-Object -First 1
+    if ($existing -and (-not $MinimumVersion -or $existing.Version -ge [version]$MinimumVersion)) {
+        return
+    }
+    if ($SkipModuleInstall) {
+        throw "Required module '$Name' is missing and -SkipModuleInstall was specified."
+    }
+    Write-Step "Installing module $Name ..." 'INFO'
+    $scope = if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { 'AllUsers' } else { 'CurrentUser' }
+    Install-Module -Name $Name -Scope $scope -Force -AllowClobber -Repository PSGallery
+}
+
+# Safely run a collection block; on failure log and return an empty array so one
+# broken workload never kills the whole report.
+function Invoke-Collection {
+    param([string]$Name, [scriptblock]$Script)
+    Write-Step "Collecting: $Name" 'INFO'
+    try {
+        $data = & $Script
+        $count = @($data).Count
+        Write-Step "  -> $count record(s)" 'OK'
+        return , @($data)
+    } catch {
+        Write-Step "  -> FAILED: $($_.Exception.Message)" 'ERROR'
+        return , @()
+    }
+}
+
+# Download a Graph usage report CSV and return it as objects.
+function Get-GraphUsageReport {
+    param([string]$ReportName, [string]$Period)
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("graphrpt_{0}_{1}.csv" -f $ReportName, [guid]::NewGuid())
+    $uri = "https://graph.microsoft.com/v1.0/reports/$ReportName(period='$Period')"
+    try {
+        Invoke-MgGraphRequest -Method GET -Uri $uri -OutputFilePath $tmp | Out-Null
+        if (Test-Path $tmp) {
+            return Import-Csv -Path $tmp
+        }
+        return @()
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Format-Gb { param($Bytes) if ($null -eq $Bytes -or $Bytes -eq '') { 0 } else { [math]::Round([double]$Bytes / 1GB, 2) } }
+
+# Download (or load) Microsoft's licensing CSV and return skuPartNumber/skuId ->
+# friendly-name lookups. The CSV has one row per service plan, so we de-dupe to
+# the first product name per SKU. Returns $null if it can't be obtained.
+function Get-SkuCatalog {
+    param([string]$Url, [string]$LocalPath)
+    $byPart = @{}; $byGuid = @{}
+    $tmp = $null
+    try {
+        $src = $LocalPath
+        if (-not $src) {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("m365skucatalog_{0}.csv" -f [guid]::NewGuid())
+            Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -TimeoutSec 60
+            $src = $tmp
+        }
+        if (-not (Test-Path $src)) { return $null }
+        Import-Csv -Path $src | ForEach-Object {
+            if ($_.String_Id -and -not $byPart.ContainsKey($_.String_Id)) { $byPart[$_.String_Id] = $_.Product_Display_Name }
+            if ($_.GUID      -and -not $byGuid.ContainsKey($_.GUID))      { $byGuid[$_.GUID]      = $_.Product_Display_Name }
+        }
+        if ($byPart.Count -eq 0) { return $null }
+        return [pscustomobject]@{ ByPartNumber = $byPart; ByGuid = $byGuid; Count = $byPart.Count }
+    } catch {
+        return $null
+    } finally {
+        if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Classify an MX host to a mail-security provider (best effort, by DNS suffix).
+function Get-MxProvider {
+    param([string]$Exchange)
+    $e = ("$Exchange").ToLower().TrimEnd('.')
+    switch -Wildcard ($e) {
+        '*.mail.protection.outlook.com' { 'Microsoft 365 (Exchange Online Protection)'; break }
+        '*.pphosted.com'                { 'Proofpoint'; break }
+        '*.ppe-hosted.com'              { 'Proofpoint Essentials'; break }
+        '*.mimecast.com'                { 'Mimecast'; break }
+        '*.mimecast.co*'                { 'Mimecast'; break }
+        '*.barracudanetworks.com'       { 'Barracuda'; break }
+        '*.cudaops.com'                 { 'Barracuda'; break }
+        '*.mailcontrol.com'             { 'Forcepoint (MailControl)'; break }
+        '*.iphmx.com'                   { 'Cisco IronPort / Trend Micro'; break }
+        '*.trendmicro.com'              { 'Trend Micro'; break }
+        '*.messagelabs.com'             { 'Broadcom / Symantec MessageLabs'; break }
+        '*aspmx.l.google.com'           { 'Google Workspace'; break }
+        '*.googlemail.com'              { 'Google Workspace'; break }
+        '*.sophos.com'                  { 'Sophos'; break }
+        '*.antispamcloud.com'           { 'SpamExperts'; break }
+        '*.hostedemail.com'             { 'Hosted email filter'; break }
+        '*.securence.com'               { 'Securence'; break }
+        '*fortimail*'                   { 'Fortinet FortiMail'; break }
+        '*.dnsmadeeasy.com'             { 'DNS Made Easy (relay)'; break }
+        default                         { 'Other / self-hosted / unknown' }
+    }
+}
+
+# Resolve a license to its friendly name: Microsoft catalog (by GUID, then part
+# number) -> built-in static map -> raw part number -> raw GUID.
+function Resolve-SkuName {
+    param($PartNumber, $SkuId, $Catalog, $StaticMap)
+    if ($Catalog) {
+        if ($SkuId      -and $Catalog.ByGuid.ContainsKey($SkuId))            { return $Catalog.ByGuid[$SkuId] }
+        if ($PartNumber -and $Catalog.ByPartNumber.ContainsKey($PartNumber)) { return $Catalog.ByPartNumber[$PartNumber] }
+    }
+    if ($PartNumber -and $StaticMap -and $StaticMap.ContainsKey($PartNumber)) { return $StaticMap[$PartNumber] }
+    if ($PartNumber) { return $PartNumber }
+    return $SkuId
+}
+
+# ---------------------------------------------------------------------------
+# 0. Modules & connection
+# ---------------------------------------------------------------------------
+
+Write-Step "M365 Pre-Migration Report" 'INFO'
+Write-Step "Workloads: $($Workload -join ', ')  |  Usage period: $UsagePeriod" 'INFO'
+
+Initialize-Module -Name 'Microsoft.Graph.Authentication'
+Initialize-Module -Name 'ImportExcel'
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module ImportExcel -ErrorAction Stop
+
+$scopes = @(
+    'Organization.Read.All', 'User.Read.All', 'Group.Read.All', 'GroupMember.Read.All',
+    'Directory.Read.All', 'Sites.Read.All', 'Reports.Read.All', 'AuditLog.Read.All',
+    'Domain.Read.All'
+)
+
+Write-Step "Connecting to Microsoft Graph..." 'INFO'
+if ($UseAppOnly) {
+    if (-not ($ClientId -and $TenantId -and $CertificateThumbprint)) {
+        throw "App-only auth requires -ClientId, -TenantId and -CertificateThumbprint."
+    }
+    Connect-MgGraph -ClientId $ClientId -TenantId $TenantId `
+        -CertificateThumbprint $CertificateThumbprint -NoWelcome
+} else {
+    $connectParams = @{ Scopes = $scopes; NoWelcome = $true }
+    if ($TenantId) { $connectParams.TenantId = $TenantId }
+    Connect-MgGraph @connectParams
+}
+
+$ctx = Get-MgContext
+if (-not $ctx) { throw "Failed to establish a Graph connection." }
+Write-Step "Connected as '$($ctx.Account)' to tenant '$($ctx.TenantId)'" 'OK'
+
+# Resolve output location. Default is the user's Documents folder — resolved via
+# GetFolderPath('MyDocuments'), which returns the *redirected* path when OneDrive
+# Known Folder Move backs up Documents. We drop reports into a tidy subfolder.
+if (-not $OutputPath) {
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    if ([string]::IsNullOrWhiteSpace($docs)) { $docs = Join-Path $env:USERPROFILE 'Documents' }
+    $OutputPath = Join-Path $docs 'M365 Pre-Migration Reports'
+}
+# Treat a path ending in .xlsx as an explicit file; anything else is a folder
+# (and may not exist yet, so we don't rely on Test-Path to classify it).
+if ($OutputPath -match '\.xlsx$') {
+    $script:OutputDir  = Split-Path $OutputPath -Parent
+    $script:OutputFile = $OutputPath
+} else {
+    $script:OutputDir  = $OutputPath
+    $script:OutputFile = $null
+}
+if ($script:OutputDir -and -not (Test-Path $script:OutputDir)) {
+    New-Item -ItemType Directory -Path $script:OutputDir -Force | Out-Null
+}
+
+$collected = [ordered]@{}   # worksheet name -> object[]
+$summary   = [System.Collections.Generic.List[object]]::new()
+$script:ExoConnected = $false
+function Add-Summary { param($Metric, $Value) $summary.Add([pscustomobject]@{ Metric = $Metric; Value = $Value }) }
+
+# ---------------------------------------------------------------------------
+# 1. Tenant / organization overview (always)
+# ---------------------------------------------------------------------------
+$org = Invoke-Collection 'Tenant overview' {
+    $resp    = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization'
+    $o       = @($resp.value)[0]
+    $domains = @($o.verifiedDomains)
+    [pscustomobject]@{
+        DisplayName        = $o.displayName
+        TenantId           = $o.id
+        DefaultDomain      = ($domains | Where-Object { $_.isDefault }).name
+        InitialDomain      = ($domains | Where-Object { $_.name -like '*.onmicrosoft.com' } | Select-Object -First 1).name
+        VerifiedDomains    = ($domains.name -join '; ')
+        Country            = $o.countryLetterCode
+        CreatedDateTime    = $o.createdDateTime
+        OnPremisesSyncEnabled = $o.onPremisesSyncEnabled
+    }
+}
+$collected['Tenant'] = $org
+if ($org) {
+    Add-Summary 'Tenant'            $org[0].DisplayName
+    Add-Summary 'Default domain'    $org[0].DefaultDomain
+    Add-Summary 'Directory sync (AD Connect)' $org[0].OnPremisesSyncEnabled
+    Add-Summary 'Report generated'  (Get-Date)
+    Add-Summary 'Source account'    $ctx.Account
+}
+
+# Now that we know the tenant, build the filename: <Tenant>-PreMigration-<date>.xlsx
+# Prefer the org display name; fall back to the initial onmicrosoft.com prefix,
+# then the default domain prefix, then the tenant id.
+if (-not $script:OutputFile) {
+    $tenantLabel = $null
+    if ($org) {
+        $tenantLabel = $org[0].DisplayName
+        if ([string]::IsNullOrWhiteSpace($tenantLabel)) {
+            if     ($org[0].InitialDomain) { $tenantLabel = ($org[0].InitialDomain -split '\.')[0] }
+            elseif ($org[0].DefaultDomain) { $tenantLabel = ($org[0].DefaultDomain -split '\.')[0] }
+            elseif ($org[0].TenantId)      { $tenantLabel = $org[0].TenantId }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($tenantLabel)) { $tenantLabel = $ctx.TenantId }
+    if ([string]::IsNullOrWhiteSpace($tenantLabel)) { $tenantLabel = 'M365' }
+
+    $safe  = (($tenantLabel -replace '[\\/:*?"<>|]', '_').Trim()) -replace '\s+', '-'
+    $stamp = Get-Date -Format 'yyyy-MM-dd'
+    $script:OutputFile = Join-Path $script:OutputDir "$safe-PreMigration-$stamp.xlsx"
+}
+$OutputPath = $script:OutputFile
+Write-Step "Report will be saved as: $(Split-Path $OutputPath -Leaf)" 'OK'
+
+# ---------------------------------------------------------------------------
+# 2. Identity & licensing
+# ---------------------------------------------------------------------------
+if ($Workload -contains 'Identity') {
+
+    # SKU friendly-name lookup (subset of common SKUs; falls back to part number)
+    $skuMap = @{
+        'O365_BUSINESS_ESSENTIALS'='M365 Business Basic'; 'O365_BUSINESS_PREMIUM'='M365 Business Standard'
+        'SPB'='M365 Business Premium'; 'ENTERPRISEPACK'='Office 365 E3'; 'ENTERPRISEPREMIUM'='Office 365 E5'
+        'SPE_E3'='Microsoft 365 E3'; 'SPE_E5'='Microsoft 365 E5'; 'SPE_F1'='Microsoft 365 F3'
+        'EXCHANGESTANDARD'='Exchange Online Plan 1'; 'EXCHANGEENTERPRISE'='Exchange Online Plan 2'
+        'POWER_BI_STANDARD'='Power BI Free'; 'FLOW_FREE'='Power Automate Free'
+        'TEAMS_EXPLORATORY'='Teams Exploratory'; 'STANDARDPACK'='Office 365 E1'
+    }
+
+    # Microsoft's published product-name catalog (friendly names). Falls back to
+    # the static $skuMap above if the download is unavailable or -OfflineSkuNames.
+    $skuCatalog = $null
+    if ($OfflineSkuNames) {
+        Write-Step "Using built-in license name map (-OfflineSkuNames)." 'INFO'
+    } else {
+        Write-Step "Fetching Microsoft license name catalog..." 'INFO'
+        $skuCatalog = Get-SkuCatalog -Url $SkuCatalogUrl -LocalPath $SkuCatalogPath
+        if ($skuCatalog) { Write-Step "  -> $($skuCatalog.Count) products in catalog" 'OK' }
+        else { Write-Step "  -> catalog unavailable; using built-in name map" 'WARN' }
+    }
+
+    # Pull subscribed SKUs once; build the display rows AND the skuId -> friendly
+    # name lookup from the same response so every assigned license resolves.
+    $skuIdToName = @{}
+    $skus = Invoke-Collection 'License SKUs' {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/subscribedSkus'
+        $raw  = @($resp.value)
+        foreach ($r in $raw) {
+            $part = $r.skuPartNumber
+            $name = Resolve-SkuName -PartNumber $part -SkuId $r.skuId -Catalog $skuCatalog -StaticMap $skuMap
+            $skuIdToName[$r.skuId] = $name
+            [pscustomobject]@{
+                Product       = $name
+                SkuPartNumber = $part
+                Enabled       = $r.prepaidUnits.enabled
+                Assigned      = $r.consumedUnits
+                Available     = [int]$r.prepaidUnits.enabled - [int]$r.consumedUnits
+                Warning       = $r.prepaidUnits.warning
+                Suspended     = $r.prepaidUnits.suspended
+            }
+        }
+    }
+    $collected['Licenses'] = $skus
+    if ($skus) { Add-Summary 'Licensed seats assigned' (($skus | Measure-Object Assigned -Sum).Sum) }
+
+    $users = Invoke-Collection 'Users' {
+        $select = 'id,displayName,userPrincipalName,mail,userType,accountEnabled,createdDateTime,assignedLicenses,onPremisesSyncEnabled,usageLocation,department,jobTitle'
+        $uri = "https://graph.microsoft.com/v1.0/users?`$select=$select&`$top=999"
+        $all = [System.Collections.Generic.List[object]]::new()
+        do {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $uri
+            foreach ($u in $page.value) {
+                $licNames = @()
+                foreach ($al in $u.assignedLicenses) {
+                    $nm = $skuIdToName[$al.skuId]
+                    if (-not $nm) { $nm = Resolve-SkuName -PartNumber $null -SkuId $al.skuId -Catalog $skuCatalog -StaticMap $skuMap }
+                    $licNames += $nm
+                }
+                $all.Add([pscustomobject]@{
+                    DisplayName        = $u.displayName
+                    UserPrincipalName  = $u.userPrincipalName
+                    Mail               = $u.mail
+                    UserType           = $u.userType
+                    AccountEnabled     = $u.accountEnabled
+                    DirSynced          = [bool]$u.onPremisesSyncEnabled
+                    UsageLocation      = $u.usageLocation
+                    Department         = $u.department
+                    JobTitle           = $u.jobTitle
+                    LicenseCount       = @($u.assignedLicenses).Count
+                    Licenses           = ($licNames -join '; ')
+                    CreatedDateTime    = $u.createdDateTime
+                })
+            }
+            $uri = $page.'@odata.nextLink'
+        } while ($uri)
+        $all
+    }
+    $collected['Users'] = $users
+    if ($users) {
+        $members = @($users | Where-Object UserType -eq 'Member')
+        $guests  = @($users | Where-Object UserType -eq 'Guest')
+        Add-Summary 'Total users'            $users.Count
+        Add-Summary '  Members'              $members.Count
+        Add-Summary '  Guests'               $guests.Count
+        Add-Summary '  Disabled accounts'    (@($users | Where-Object { -not $_.AccountEnabled }).Count)
+        Add-Summary '  Licensed users'       (@($users | Where-Object { $_.LicenseCount -gt 0 }).Count)
+        Add-Summary '  Directory-synced'     (@($users | Where-Object DirSynced).Count)
+    }
+
+    $mfa = Invoke-Collection 'MFA / auth-method registration' {
+        $uri = "https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails?`$top=999"
+        $all = [System.Collections.Generic.List[object]]::new()
+        do {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $uri
+            foreach ($r in $page.value) {
+                $all.Add([pscustomobject]@{
+                    UserPrincipalName    = $r.userPrincipalName
+                    DisplayName          = $r.userDisplayName
+                    MfaCapable           = $r.isMfaCapable
+                    MfaRegistered        = $r.isMfaRegistered
+                    SsprCapable          = $r.isSsprCapable
+                    DefaultMethod        = $r.defaultMfaMethod
+                    Methods              = ($r.methodsRegistered -join '; ')
+                    IsAdmin              = $r.isAdmin
+                })
+            }
+            $uri = $page.'@odata.nextLink'
+        } while ($uri)
+        $all
+    }
+    $collected['MFA-Registration'] = $mfa
+    if ($mfa) {
+        Add-Summary 'MFA-registered users' (@($mfa | Where-Object MfaRegistered).Count)
+        Add-Summary 'MFA-capable users'    (@($mfa | Where-Object MfaCapable).Count)
+    }
+
+    # Domains and their authentication type. Federated domains (ADFS / third-party
+    # IdP) do NOT carry over in a tenant-to-tenant move: they must be converted to
+    # managed or re-federated against the target tenant, so flag them clearly.
+    $domains = Invoke-Collection 'Domains (federation / managed)' {
+        $rows = [System.Collections.Generic.List[object]]::new()
+        $uri = 'https://graph.microsoft.com/v1.0/domains'
+        do {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $uri
+            foreach ($d in @($page.value)) {
+                $issuer = $null; $passiveUri = $null
+                if ($d.authenticationType -eq 'Federated') {
+                    try {
+                        $fc  = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/domains/$($d.id)/federationConfiguration"
+                        $cfg = @($fc.value)[0]
+                        $issuer     = $cfg.issuerUri
+                        $passiveUri = $cfg.passiveSignInUri
+                    } catch { }
+                }
+                $rows.Add([pscustomobject]@{
+                    Domain              = $d.id
+                    AuthenticationType  = $d.authenticationType   # Managed | Federated
+                    IsFederated         = ($d.authenticationType -eq 'Federated')
+                    IsDefault           = $d.isDefault
+                    IsInitial           = $d.isInitial
+                    IsVerified          = $d.isVerified
+                    IsAdminManaged      = $d.isAdminManaged
+                    SupportedServices   = ($d.supportedServices -join '; ')
+                    FederationIssuerUri = $issuer
+                    PassiveSignInUri    = $passiveUri
+                })
+            }
+            $uri = $page.'@odata.nextLink'
+        } while ($uri)
+        $rows
+    }
+    $collected['Domains'] = $domains
+    if ($domains) {
+        $fed = @($domains | Where-Object IsFederated)
+        Add-Summary 'Verified domains'  (@($domains | Where-Object IsVerified).Count)
+        Add-Summary 'Federated domains' ($(if ($fed.Count) { "$($fed.Count): " + ($fed.Domain -join ', ') } else { 'None (all managed)' }))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Exchange / mailboxes (usage report)
+# ---------------------------------------------------------------------------
+if ($Workload -contains 'Exchange') {
+
+    # Mailbox type (User/Shared/Room/Equipment) isn't exposed by Graph, so connect
+    # to Exchange Online and build a UPN/SMTP -> RecipientTypeDetails lookup.
+    # Best-effort: any failure leaves the type as "Unknown" rather than aborting.
+    $mbxTypeMap = @{}
+    $exoMailboxes = @()
+    if (-not $SkipMailboxType) {
+        try {
+            Initialize-Module -Name 'ExchangeOnlineManagement'
+            Import-Module ExchangeOnlineManagement -ErrorAction Stop
+            Write-Step "Connecting to Exchange Online (for mailbox type)..." 'INFO'
+            if ($UseAppOnly) {
+                $exoOrg = if ($org -and $org[0].InitialDomain) { $org[0].InitialDomain }
+                          elseif ($TenantId) { $TenantId } else { $ctx.TenantId }
+                Connect-ExchangeOnline -AppId $ClientId -CertificateThumbprint $CertificateThumbprint `
+                    -Organization $exoOrg -ShowBanner:$false -ErrorAction Stop
+            } else {
+                Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+            }
+            $script:ExoConnected = $true
+            Write-Step "  -> retrieving mailboxes..." 'INFO'
+            $exoMailboxes = @(Get-EXOMailbox -ResultSize Unlimited `
+                -Properties RecipientTypeDetails, GrantSendOnBehalfTo -ErrorAction Stop)
+            foreach ($m in $exoMailboxes) {
+                if ($m.UserPrincipalName)  { $mbxTypeMap[("$($m.UserPrincipalName)").ToLower()]  = $m.RecipientTypeDetails }
+                if ($m.PrimarySmtpAddress) { $mbxTypeMap[("$($m.PrimarySmtpAddress)").ToLower()] = $m.RecipientTypeDetails }
+            }
+            Write-Step "  -> $($exoMailboxes.Count) mailboxes, $($mbxTypeMap.Count) identities mapped" 'OK'
+        } catch {
+            Write-Step "  -> Exchange Online unavailable: $($_.Exception.Message)" 'WARN'
+            Write-Step "     MailboxType will read 'Unknown'. Re-run without -SkipMailboxType once ExO is reachable." 'WARN'
+        }
+    }
+
+    $mbx = Invoke-Collection 'Mailbox usage' {
+        Get-GraphUsageReport -ReportName 'getMailboxUsageDetail' -Period $UsagePeriod | ForEach-Object {
+            $upn   = $_.'User Principal Name'
+            $mtype = if ($upn -and $mbxTypeMap.ContainsKey(("$upn").ToLower())) { $mbxTypeMap[("$upn").ToLower()] }
+                     elseif ($SkipMailboxType) { 'Unknown (skipped)' } else { 'Unknown' }
+            [pscustomobject]@{
+                DisplayName       = $_.'Display Name'
+                UserPrincipalName = $upn
+                MailboxType       = $mtype
+                IsShared          = ($mtype -eq 'SharedMailbox')
+                IsDeleted         = $_.'Is Deleted'
+                ItemCount         = [int64]($_.'Item Count' -as [int64])
+                UsedGB            = Format-Gb $_.'Storage Used (Byte)'
+                IssueWarningGB    = Format-Gb $_.'Issue Warning Quota (Byte)'
+                ProhibitSendGB    = Format-Gb $_.'Prohibit Send Quota (Byte)'
+                ProhibitSendRecvGB= Format-Gb $_.'Prohibit Send/Receive Quota (Byte)'
+                LastActivityDate  = $_.'Last Activity Date'
+                CreatedDate       = $_.'Created Date'
+            }
+        }
+    }
+    $collected['Mailboxes'] = $mbx
+    if ($mbx) {
+        Add-Summary 'Mailboxes'              $mbx.Count
+        Add-Summary '  Shared mailboxes'     (@($mbx | Where-Object { $_.MailboxType -eq 'SharedMailbox' }).Count)
+        Add-Summary '  Room mailboxes'       (@($mbx | Where-Object { $_.MailboxType -eq 'RoomMailbox' }).Count)
+        Add-Summary '  Equipment mailboxes'  (@($mbx | Where-Object { $_.MailboxType -eq 'EquipmentMailbox' }).Count)
+        Add-Summary 'Mailbox storage (GB)'   ([math]::Round((($mbx | Measure-Object UsedGB -Sum).Sum), 2))
+        Add-Summary 'Largest mailbox (GB)'   (($mbx | Measure-Object UsedGB -Maximum).Maximum)
+    }
+
+    # Mailbox delegation: FullAccess, SendAs and SendOnBehalf. These do NOT follow
+    # a tenant-to-tenant move and must be re-applied on the target, so they're a
+    # key pre-migration inventory. Requires the ExO connection above.
+    if (-not $SkipDelegation -and $script:ExoConnected -and $exoMailboxes.Count) {
+        $delegation = Invoke-Collection 'Mailbox delegation (FullAccess / SendAs / SendOnBehalf)' {
+            $rows = [System.Collections.Generic.List[object]]::new()
+            foreach ($m in $exoMailboxes) {
+                $id = "$($m.PrimarySmtpAddress)"
+                # FullAccess (explicit grants only; skip inherited and NT AUTHORITY\SELF)
+                try {
+                    Get-EXOMailboxPermission -Identity $id -ErrorAction Stop | Where-Object {
+                        $_.AccessRights -contains 'FullAccess' -and -not $_.IsInherited -and
+                        $_.User -notlike 'NT AUTHORITY\*' -and $_.User -ne $m.UserPrincipalName
+                    } | ForEach-Object {
+                        $rows.Add([pscustomobject]@{
+                            Mailbox = $id; MailboxType = $m.RecipientTypeDetails
+                            Permission = 'FullAccess'; Delegate = $_.User
+                        })
+                    }
+                } catch { }
+                # SendAs
+                try {
+                    Get-EXORecipientPermission -Identity $id -ErrorAction Stop | Where-Object {
+                        $_.AccessRights -contains 'SendAs' -and $_.Trustee -notlike 'NT AUTHORITY\*'
+                    } | ForEach-Object {
+                        $rows.Add([pscustomobject]@{
+                            Mailbox = $id; MailboxType = $m.RecipientTypeDetails
+                            Permission = 'SendAs'; Delegate = $_.Trustee
+                        })
+                    }
+                } catch { }
+                # SendOnBehalf (from the mailbox object)
+                foreach ($sob in @($m.GrantSendOnBehalfTo)) {
+                    if ($sob) {
+                        $rows.Add([pscustomobject]@{
+                            Mailbox = $id; MailboxType = $m.RecipientTypeDetails
+                            Permission = 'SendOnBehalf'; Delegate = "$sob"
+                        })
+                    }
+                }
+            }
+            $rows
+        }
+        $collected['Delegation'] = $delegation
+        if ($delegation) {
+            Add-Summary 'Delegation grants (Full/SendAs/OnBehalf)' $delegation.Count
+            Add-Summary '  Mailboxes with delegation' (@($delegation | Select-Object -ExpandProperty Mailbox -Unique).Count)
+        }
+    }
+
+    # Distribution lists / mail-enabled groups (Graph).
+    $distGroups = Invoke-Collection 'Mail-enabled groups' {
+        $uri = "https://graph.microsoft.com/v1.0/groups?`$filter=mailEnabled eq true&`$select=displayName,mail,mailNickname,groupTypes,securityEnabled&`$top=999"
+        $all = [System.Collections.Generic.List[object]]::new()
+        do {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $uri
+            foreach ($g in $page.value) {
+                $type = if ($g.groupTypes -contains 'Unified') { 'M365 Group' }
+                        elseif ($g.securityEnabled) { 'Mail-enabled security' } else { 'Distribution list' }
+                $all.Add([pscustomobject]@{
+                    DisplayName = $g.displayName; Mail = $g.mail
+                    Alias = $g.mailNickname; Type = $type
+                })
+            }
+            $uri = $page.'@odata.nextLink'
+        } while ($uri)
+        $all
+    }
+    $collected['MailGroups'] = $distGroups
+    if ($distGroups) { Add-Summary 'Mail-enabled groups' $distGroups.Count }
+
+    # MX lookup: is inbound mail delivered straight to M365/EOP, or through a
+    # third-party filtering gateway (Mimecast/Proofpoint/Barracuda/etc.)? The
+    # gateway must be re-pointed/re-created against the target tenant at cutover.
+    $mxRows = Invoke-Collection 'MX / inbound mail routing' {
+        $rows = [System.Collections.Generic.List[object]]::new()
+        $domainList = @()
+        if ($org -and $org[0].VerifiedDomains) { $domainList = $org[0].VerifiedDomains -split '\s*;\s*' }
+        $domainList = $domainList | Where-Object { $_ -and $_ -notlike '*.onmicrosoft.com' } | Sort-Object -Unique
+        foreach ($d in $domainList) {
+            try {
+                $recs = @(Resolve-DnsName -Name $d -Type MX -ErrorAction Stop |
+                    Where-Object { $_.QueryType -eq 'MX' } | Sort-Object Preference)
+                if (-not $recs) {
+                    $rows.Add([pscustomobject]@{
+                        Domain = $d; Preference = $null; MailExchange = '(no MX record)'
+                        Provider = 'None'; ThirdPartyInbound = $false
+                    })
+                    continue
+                }
+                foreach ($r in $recs) {
+                    $isM365 = (("$($r.NameExchange)").ToLower().TrimEnd('.')) -like '*.mail.protection.outlook.com'
+                    $rows.Add([pscustomobject]@{
+                        Domain = $d; Preference = $r.Preference; MailExchange = $r.NameExchange
+                        Provider = (Get-MxProvider -Exchange $r.NameExchange)
+                        ThirdPartyInbound = (-not $isM365)
+                    })
+                }
+            } catch {
+                $rows.Add([pscustomobject]@{
+                    Domain = $d; Preference = $null
+                    MailExchange = "(lookup failed: $($_.Exception.Message))"
+                    Provider = 'Unknown'; ThirdPartyInbound = $null
+                })
+            }
+        }
+        $rows
+    }
+    $collected['MX-Records'] = $mxRows
+    if ($mxRows) {
+        $tpDomains = @($mxRows | Where-Object { $_.ThirdPartyInbound -eq $true } |
+            Select-Object -ExpandProperty Domain -Unique)
+        if ($tpDomains.Count) {
+            Add-Summary '3rd-party inbound mail filtering' ("Yes: " + ($tpDomains -join ', '))
+        } else {
+            Add-Summary '3rd-party inbound mail filtering' 'No (delivered directly to M365 / EOP)'
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. SharePoint & OneDrive (usage reports)
+# ---------------------------------------------------------------------------
+if ($Workload -contains 'SharePoint') {
+    $spo = Invoke-Collection 'SharePoint site usage' {
+        Get-GraphUsageReport -ReportName 'getSharePointSiteUsageDetail' -Period $UsagePeriod | ForEach-Object {
+            [pscustomobject]@{
+                SiteUrl          = $_.'Site URL'
+                OwnerDisplayName = $_.'Owner Display Name'
+                IsDeleted        = $_.'Is Deleted'
+                FileCount        = [int64]($_.'File Count' -as [int64])
+                ActiveFileCount  = [int64]($_.'Active File Count' -as [int64])
+                StorageUsedGB    = Format-Gb $_.'Storage Used (Byte)'
+                StorageAllocGB   = Format-Gb $_.'Storage Allocated (Byte)'
+                LastActivityDate = $_.'Last Activity Date'
+                Template         = $_.'Root Web Template'
+            }
+        }
+    }
+    $collected['SharePoint'] = $spo
+    if ($spo) {
+        Add-Summary 'SharePoint sites'        $spo.Count
+        Add-Summary 'SharePoint storage (GB)' ([math]::Round((($spo | Measure-Object StorageUsedGB -Sum).Sum), 2))
+    }
+
+    $od = Invoke-Collection 'OneDrive usage' {
+        Get-GraphUsageReport -ReportName 'getOneDriveUsageAccountDetail' -Period $UsagePeriod | ForEach-Object {
+            [pscustomobject]@{
+                OwnerUPN         = $_.'Owner Principal Name'
+                OwnerDisplayName = $_.'Owner Display Name'
+                IsDeleted        = $_.'Is Deleted'
+                FileCount        = [int64]($_.'File Count' -as [int64])
+                ActiveFileCount  = [int64]($_.'Active File Count' -as [int64])
+                StorageUsedGB    = Format-Gb $_.'Storage Used (Byte)'
+                StorageAllocGB   = Format-Gb $_.'Storage Allocated (Byte)'
+                LastActivityDate = $_.'Last Activity Date'
+            }
+        }
+    }
+    $collected['OneDrive'] = $od
+    if ($od) {
+        Add-Summary 'OneDrive accounts'     $od.Count
+        Add-Summary 'OneDrive storage (GB)' ([math]::Round((($od | Measure-Object StorageUsedGB -Sum).Sum), 2))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5. Teams & Groups
+# ---------------------------------------------------------------------------
+if ($Workload -contains 'Teams') {
+    $groups = Invoke-Collection 'M365 groups & Teams' {
+        $select = 'id,displayName,mail,visibility,createdDateTime,groupTypes,resourceProvisioningOptions'
+        $uri = "https://graph.microsoft.com/v1.0/groups?`$filter=groupTypes/any(c:c eq 'Unified')&`$select=$select&`$top=999"
+        $all = [System.Collections.Generic.List[object]]::new()
+        do {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $uri
+            foreach ($g in $page.value) {
+                $isTeam = $g.resourceProvisioningOptions -contains 'Team'
+                # owner / member counts
+                $oc = 0; $mc = 0
+                try {
+                    $oc = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$($g.id)/owners/`$count" -Headers @{ ConsistencyLevel = 'eventual' })
+                    $mc = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$($g.id)/members/`$count" -Headers @{ ConsistencyLevel = 'eventual' })
+                } catch { }
+                $all.Add([pscustomobject]@{
+                    DisplayName     = $g.displayName
+                    Mail            = $g.mail
+                    IsTeam          = $isTeam
+                    Visibility      = $g.visibility
+                    OwnerCount      = $oc
+                    MemberCount     = $mc
+                    CreatedDateTime = $g.createdDateTime
+                })
+            }
+            $uri = $page.'@odata.nextLink'
+        } while ($uri)
+        $all
+    }
+    $collected['Teams-Groups'] = $groups
+    if ($groups) {
+        $teams = @($groups | Where-Object IsTeam)
+        Add-Summary 'Microsoft 365 groups' $groups.Count
+        Add-Summary '  of which Teams'      $teams.Count
+        Add-Summary '  Public groups'       (@($groups | Where-Object Visibility -eq 'Public').Count)
+        Add-Summary '  Groups w/o owner'    (@($groups | Where-Object { $_.OwnerCount -eq 0 }).Count)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 6. Write the workbook
+# ---------------------------------------------------------------------------
+Write-Step "Writing workbook: $OutputPath" 'INFO'
+if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
+
+$elapsed = (New-TimeSpan -Start $script:StartTime -End (Get-Date))
+Add-Summary 'Run duration' ("{0:mm\:ss}" -f $elapsed)
+
+# Summary sheet first
+$summary | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -AutoSize -BoldTopRow `
+    -Title 'M365 Pre-Migration Summary' -TitleBold -TitleSize 14 -FreezeTopRow
+
+foreach ($sheet in $collected.Keys) {
+    $data = $collected[$sheet]
+    if (-not $data -or @($data).Count -eq 0) {
+        @([pscustomobject]@{ Note = 'No data collected (workload skipped, empty, or permission/concealment issue).' }) |
+            Export-Excel -Path $OutputPath -WorksheetName $sheet -AutoSize
+        continue
+    }
+    $data | Export-Excel -Path $OutputPath -WorksheetName $sheet -AutoSize -AutoFilter `
+        -BoldTopRow -FreezeTopRow -TableStyle 'Medium2'
+}
+
+Write-Step "Done. Report saved to: $OutputPath" 'OK'
+Write-Step "Worksheets: Summary, $($collected.Keys -join ', ')" 'INFO'
+
+try { Disconnect-MgGraph | Out-Null } catch { }
+if ($script:ExoConnected) { try { Disconnect-ExchangeOnline -Confirm:$false | Out-Null } catch { } }

@@ -1,0 +1,12 @@
+# Client / tenant report output — NEVER commit real customer data
+*.xlsx
+*.xls
+*.csv
+
+# Local SKU catalog cache (if saved)
+Product*names*.csv
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.tmp
