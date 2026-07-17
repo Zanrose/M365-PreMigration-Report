@@ -120,4 +120,9 @@ to the built-in map — it never aborts the run over license names.
 
 - Add a destination-tenant capacity check (compare source storage totals vs. target license entitlements).
 - Add Conditional Access policy export (`/identity/conditionalAccess/policies`) — these don't migrate and must be rebuilt.
-- Add a domains sheet to plan the target-tenant domain re-verification sequence.
+- Add SPF/DKIM/DMARC records to the MX pass — the other mail-authentication config to rebuild on the target.
+- Add directory-role assignments (who holds Global Admin, Exchange Admin, etc.) — rebuilt manually on the target.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Free to use, modify, and redistribute with attribution.
