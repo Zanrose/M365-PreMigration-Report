@@ -106,11 +106,28 @@ param(
     # to point at a previously saved copy of the CSV (air-gapped runs).
     [switch]$OfflineSkuNames,
     [string]$SkuCatalogPath,
-    [string]$SkuCatalogUrl = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
+    [string]$SkuCatalogUrl = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv',
+
+    # Self-update. On start the script checks GitHub for a newer version, shows the
+    # changelog, and (after you confirm) downloads and replaces itself.
+    #   -SkipUpdateCheck : don't check at all
+    #   -AutoUpdate      : apply a newer version without prompting (unattended)
+    #   -UpdateToken     : a GitHub PAT, only needed while the repo is private
+    [switch]$SkipUpdateCheck,
+    [switch]$AutoUpdate,
+    [string]$UpdateToken
 )
 
 $ErrorActionPreference = 'Stop'
 $script:StartTime = Get-Date
+
+# Version + self-update source. Keep the $ScriptVersion line in this exact format;
+# the updater parses it out of the remote copy to detect newer releases.
+$ScriptVersion       = '1.1.0'
+$script:RepoOwner    = 'Zanrose'
+$script:RepoName     = 'M365-PreMigration-Report'
+$script:RepoBranch   = 'main'
+$script:ScriptFileName = 'New-M365PreMigrationReport.ps1'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -127,6 +144,111 @@ function Write-Step {
     Write-Host ("[{0:HH:mm:ss}] " -f (Get-Date)) -NoNewline -ForegroundColor DarkGray
     Write-Host ("{0,-5} " -f $Status) -NoNewline -ForegroundColor $color
     Write-Host $Message
+}
+
+# --- Self-update ----------------------------------------------------------
+
+# Fetch a file from the repo. Tries the gh CLI first (uses the caller's existing
+# auth, so it works while the repo is private), then the anonymous/token REST API
+# (works once the repo is public, or with -UpdateToken / $env:GITHUB_TOKEN).
+function Get-RemoteRepoFile {
+    param([string]$Path)
+    $api = "repos/$($script:RepoOwner)/$($script:RepoName)/contents/$Path"
+    $gh  = Get-Command gh -ErrorAction SilentlyContinue
+    if ($gh) {
+        try {
+            $out = & $gh.Source api "$api`?ref=$($script:RepoBranch)" -H 'Accept: application/vnd.github.raw' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out) { return ($out -join "`n") }
+        } catch { }
+    }
+    $uri     = "https://api.github.com/$api`?ref=$($script:RepoBranch)"
+    $headers = @{ 'Accept' = 'application/vnd.github.raw'; 'User-Agent' = 'M365PreMigrationReport-Updater' }
+    $token   = if ($UpdateToken) { $UpdateToken } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $null }
+    if ($token) { $headers['Authorization'] = "token $token" }
+    return Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+}
+
+# Print only the changelog sections newer than the installed version.
+function Show-ChangelogSince {
+    param([string]$Changelog, [version]$Since)
+    $show = $false; $any = $false
+    foreach ($line in ($Changelog -split "`r?`n")) {
+        $h = [regex]::Match($line, '^##+\s*\[?v?([0-9]+\.[0-9]+\.[0-9]+)\]?')
+        if ($h.Success) {
+            $show = ([version]$h.Groups[1].Value -gt $Since)
+            if ($show) { $any = $true }
+        }
+        if ($show) { Write-Host "   $line" }
+    }
+    if (-not $any) { Write-Host $Changelog }   # fallback: unparseable, show all
+}
+
+# Validate the downloaded script, back up the current file, and replace it.
+function Install-ScriptUpdate {
+    param([string]$NewContent, [version]$NewVersion)
+    $target = $PSCommandPath
+    if (-not $target) {
+        Write-Step "Cannot self-update: script path unknown (not running from a .ps1 file)." 'ERROR'
+        return
+    }
+    $perr = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($NewContent, [ref]$null, [ref]$perr) | Out-Null
+    if ($perr -and $perr.Count) {
+        Write-Step "Downloaded update failed syntax validation; keeping current version." 'ERROR'
+        return
+    }
+    try {
+        $backup = "$target.v$ScriptVersion.bak"
+        Copy-Item -LiteralPath $target -Destination $backup -Force
+        Set-Content -LiteralPath $target -Value $NewContent -Encoding UTF8
+        Write-Step "Updated to v$NewVersion. Backup: $(Split-Path $backup -Leaf)" 'OK'
+        Write-Step "Please re-run the script to use the new version." 'OK'
+        exit 0
+    } catch {
+        Write-Step "Update failed while writing the file: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+# Orchestrates the check: compare versions, show changelog, prompt, apply.
+function Invoke-UpdateCheck {
+    if ($SkipUpdateCheck) { return }
+    Write-Step "Checking for updates (current v$ScriptVersion)..." 'INFO'
+    try {
+        $remoteScript = Get-RemoteRepoFile -Path $script:ScriptFileName
+    } catch {
+        Write-Step "  -> update check skipped ($($_.Exception.Message))" 'WARN'
+        return
+    }
+    $m = [regex]::Match($remoteScript, '\$ScriptVersion\s*=\s*''([\d.]+)''')
+    if (-not $m.Success) { Write-Step "  -> couldn't read remote version; skipping" 'WARN'; return }
+
+    $remoteVer = [version]$m.Groups[1].Value
+    $localVer  = [version]$ScriptVersion
+    if ($remoteVer -le $localVer) { Write-Step "  -> up to date" 'OK'; return }
+
+    Write-Step "  -> update available: v$localVer -> v$remoteVer" 'WARN'
+    $changelog = $null
+    try { $changelog = Get-RemoteRepoFile -Path 'CHANGELOG.md' } catch { }
+    Write-Host ""
+    Write-Host "  ----------------- What's new -----------------" -ForegroundColor Cyan
+    if ($changelog) { Show-ChangelogSince -Changelog $changelog -Since $localVer }
+    else { Write-Host "   (no CHANGELOG.md found in the repo)" }
+    Write-Host "  ----------------------------------------------" -ForegroundColor Cyan
+    Write-Host ""
+
+    $accept = $false
+    if ($AutoUpdate) {
+        $accept = $true
+    } elseif (-not [Environment]::UserInteractive) {
+        Write-Step "Non-interactive session; skipping. Use -AutoUpdate to apply unattended." 'WARN'
+        return
+    } else {
+        $answer = Read-Host "  Download and apply update v$remoteVer now? (Y/N)"
+        $accept = ($answer -match '^(y|yes)$')
+    }
+    if (-not $accept) { Write-Step "Update declined; continuing with v$localVer." 'INFO'; return }
+
+    Install-ScriptUpdate -NewContent $remoteScript -NewVersion $remoteVer
 }
 
 function Initialize-Module {
@@ -252,8 +374,11 @@ function Resolve-SkuName {
 # 0. Modules & connection
 # ---------------------------------------------------------------------------
 
-Write-Step "M365 Pre-Migration Report" 'INFO'
+Write-Step "M365 Pre-Migration Report (v$ScriptVersion)" 'INFO'
 Write-Step "Workloads: $($Workload -join ', ')  |  Usage period: $UsagePeriod" 'INFO'
+
+# Check for a newer version before doing any work (may prompt / self-update / exit).
+Invoke-UpdateCheck
 
 Initialize-Module -Name 'Microsoft.Graph.Authentication'
 Initialize-Module -Name 'ImportExcel'

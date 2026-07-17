@@ -54,7 +54,21 @@ so the script is portable across machines and users — no paths to edit. Overri
 Parameters: `-OutputPath`, `-TenantId`, `-Workload` (Identity/Exchange/SharePoint/Teams),
 `-UsagePeriod` (D7/D30/D90/D180), `-UseAppOnly` / `-ClientId` / `-CertificateThumbprint`,
 `-SkipModuleInstall`, `-SkipMailboxType`, `-SkipDelegation`, `-OfflineSkuNames`,
-`-SkuCatalogPath`, `-SkuCatalogUrl`.
+`-SkuCatalogPath`, `-SkuCatalogUrl`, `-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
+
+## Self-update
+
+On start the script compares its `$ScriptVersion` against the copy in this GitHub repo
+(`main` branch). If a newer version exists it prints the relevant [CHANGELOG](CHANGELOG.md)
+entries and asks before downloading and replacing itself. The current file is backed up to
+`<script>.v<old>.bak` first, and the download is syntax-checked before it's written, so a bad
+download can't clobber a working script. After an update it exits and asks you to re-run.
+
+- `-SkipUpdateCheck` — never check (e.g. offline / locked-down environments).
+- `-AutoUpdate` — apply a newer version without prompting (for scheduled/unattended runs).
+- `-UpdateToken <PAT>` — a GitHub token, **only needed while the repo is private**. If the
+  GitHub CLI (`gh`) is installed and signed in, the script uses that automatically and no
+  token is needed. Once the repo is public, the check works anonymously.
 
 ## License friendly names
 
