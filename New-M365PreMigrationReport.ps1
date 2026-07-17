@@ -152,17 +152,34 @@ function Write-Step {
 # auth, so it works while the repo is private), then the anonymous/token REST API
 # (works once the repo is public, or with -UpdateToken / $env:GITHUB_TOKEN).
 function Get-RemoteRepoFile {
-    param([string]$Path)
+    param([string]$Path, [string]$Ref = $script:RepoBranch)
     $api = "repos/$($script:RepoOwner)/$($script:RepoName)/contents/$Path"
     $gh  = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
         try {
-            $out = & $gh.Source api "$api`?ref=$($script:RepoBranch)" -H 'Accept: application/vnd.github.raw' 2>$null
+            $out = & $gh.Source api "$api`?ref=$Ref" -H 'Accept: application/vnd.github.raw' 2>$null
             if ($LASTEXITCODE -eq 0 -and $out) { return ($out -join "`n") }
         } catch { }
     }
-    $uri     = "https://api.github.com/$api`?ref=$($script:RepoBranch)"
+    $uri     = "https://api.github.com/$api`?ref=$Ref"
     $headers = @{ 'Accept' = 'application/vnd.github.raw'; 'User-Agent' = 'M365PreMigrationReport-Updater' }
+    $token   = if ($UpdateToken) { $UpdateToken } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $null }
+    if ($token) { $headers['Authorization'] = "token $token" }
+    return Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+}
+
+# Call a GitHub REST API path and return parsed JSON (gh CLI -> token/anon REST).
+function Invoke-GitHubApi {
+    param([string]$ApiPath)
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if ($gh) {
+        try {
+            $out = & $gh.Source api $ApiPath 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out) { return (($out -join "`n") | ConvertFrom-Json) }
+        } catch { }
+    }
+    $uri     = "https://api.github.com/$ApiPath"
+    $headers = @{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = 'M365PreMigrationReport-Updater' }
     $token   = if ($UpdateToken) { $UpdateToken } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $null }
     if ($token) { $headers['Authorization'] = "token $token" }
     return Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30 -ErrorAction Stop
@@ -209,30 +226,55 @@ function Install-ScriptUpdate {
     }
 }
 
-# Orchestrates the check: compare versions, show changelog, prompt, apply.
+# Orchestrates the check: find the latest version, show notes, prompt, apply.
+# Primary source is the latest published GitHub Release; if none exist (or the
+# call fails) it falls back to parsing $ScriptVersion off the main branch.
 function Invoke-UpdateCheck {
     if ($SkipUpdateCheck) { return }
     Write-Step "Checking for updates (current v$ScriptVersion)..." 'INFO'
-    try {
-        $remoteScript = Get-RemoteRepoFile -Path $script:ScriptFileName
-    } catch {
-        Write-Step "  -> update check skipped ($($_.Exception.Message))" 'WARN'
-        return
-    }
-    $m = [regex]::Match($remoteScript, '\$ScriptVersion\s*=\s*''([\d.]+)''')
-    if (-not $m.Success) { Write-Step "  -> couldn't read remote version; skipping" 'WARN'; return }
-
-    $remoteVer = [version]$m.Groups[1].Value
     $localVer  = [version]$ScriptVersion
+    $remoteVer = $null
+    $notes     = $null
+    $ref       = $script:RepoBranch
+
+    # Primary: latest published release
+    try {
+        $rel = Invoke-GitHubApi -ApiPath "repos/$($script:RepoOwner)/$($script:RepoName)/releases/latest"
+        if ($rel -and $rel.tag_name) {
+            $vm = [regex]::Match([string]$rel.tag_name, '([0-9]+\.[0-9]+\.[0-9]+)')
+            if ($vm.Success) {
+                $remoteVer = [version]$vm.Groups[1].Value
+                $ref       = $rel.tag_name
+                $notes     = $rel.body
+            }
+        }
+    } catch { }
+
+    # Fallback: parse the version marker off the main branch
+    if (-not $remoteVer) {
+        try {
+            $remoteScript = Get-RemoteRepoFile -Path $script:ScriptFileName
+            $m = [regex]::Match($remoteScript, '\$ScriptVersion\s*=\s*''([\d.]+)''')
+            if ($m.Success) { $remoteVer = [version]$m.Groups[1].Value; $ref = $script:RepoBranch }
+        } catch {
+            Write-Step "  -> update check skipped ($($_.Exception.Message))" 'WARN'
+            return
+        }
+    }
+    if (-not $remoteVer) { Write-Step "  -> couldn't determine latest version; skipping" 'WARN'; return }
     if ($remoteVer -le $localVer) { Write-Step "  -> up to date" 'OK'; return }
 
     Write-Step "  -> update available: v$localVer -> v$remoteVer" 'WARN'
-    $changelog = $null
-    try { $changelog = Get-RemoteRepoFile -Path 'CHANGELOG.md' } catch { }
     Write-Host ""
     Write-Host "  ----------------- What's new -----------------" -ForegroundColor Cyan
-    if ($changelog) { Show-ChangelogSince -Changelog $changelog -Since $localVer }
-    else { Write-Host "   (no CHANGELOG.md found in the repo)" }
+    if ($notes) {
+        foreach ($l in ($notes -split "`r?`n")) { Write-Host "   $l" }
+    } else {
+        $changelog = $null
+        try { $changelog = Get-RemoteRepoFile -Path 'CHANGELOG.md' } catch { }
+        if ($changelog) { Show-ChangelogSince -Changelog $changelog -Since $localVer }
+        else { Write-Host "   (no release notes found)" }
+    }
     Write-Host "  ----------------------------------------------" -ForegroundColor Cyan
     Write-Host ""
 
@@ -248,7 +290,14 @@ function Invoke-UpdateCheck {
     }
     if (-not $accept) { Write-Step "Update declined; continuing with v$localVer." 'INFO'; return }
 
-    Install-ScriptUpdate -NewContent $remoteScript -NewVersion $remoteVer
+    # Download the script at the resolved ref (release tag, or main for the fallback)
+    try {
+        $newContent = Get-RemoteRepoFile -Path $script:ScriptFileName -Ref $ref
+    } catch {
+        Write-Step "Failed to download update: $($_.Exception.Message)" 'ERROR'
+        return
+    }
+    Install-ScriptUpdate -NewContent $newContent -NewVersion $remoteVer
 }
 
 function Initialize-Module {

@@ -5,10 +5,11 @@ This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PAT
 
 ## [1.1.0] - 2026-07-17
 ### Added
-- **Self-update.** On start the script checks GitHub for a newer version, prints
-  the changelog entries newer than the installed version, and — after you confirm
-  — downloads and replaces itself (with a `.bak` backup and syntax validation of
-  the download). New switches: `-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
+- **Self-update.** On start the script checks GitHub for a newer version — reading
+  the latest published **Release** (falling back to the `main` branch if none),
+  prints that release's notes, and — after you confirm — downloads and replaces
+  itself (with a `.bak` backup and syntax validation of the download). New
+  switches: `-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
 - **Portable output location.** Reports now default to
   `Documents\M365 Pre-Migration Reports\`, resolved per-user at runtime and
   OneDrive-redirect aware, so the script runs unmodified on any machine.

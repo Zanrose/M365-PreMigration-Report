@@ -58,11 +58,14 @@ Parameters: `-OutputPath`, `-TenantId`, `-Workload` (Identity/Exchange/SharePoin
 
 ## Self-update
 
-On start the script compares its `$ScriptVersion` against the copy in this GitHub repo
-(`main` branch). If a newer version exists it prints the relevant [CHANGELOG](CHANGELOG.md)
-entries and asks before downloading and replacing itself. The current file is backed up to
-`<script>.v<old>.bak` first, and the download is syntax-checked before it's written, so a bad
-download can't clobber a working script. After an update it exits and asks you to re-run.
+On start the script compares its `$ScriptVersion` against the latest published
+[GitHub Release](https://github.com/Zanrose/M365-PreMigration-Report/releases) (falling back
+to the `main` branch if no releases exist). If a newer version exists it prints that release's
+notes and asks before downloading and replacing itself — pulling the script *at that release
+tag*, so you always get a coherent published version rather than in-progress `main`. The
+current file is backed up to `<script>.v<old>.bak` first, and the download is syntax-checked
+before it's written, so a bad download can't clobber a working script. After an update it
+exits and asks you to re-run.
 
 - `-SkipUpdateCheck` — never check (e.g. offline / locked-down environments).
 - `-AutoUpdate` — apply a newer version without prompting (for scheduled/unattended runs).
