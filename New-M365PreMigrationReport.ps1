@@ -123,7 +123,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.1.0'
+$ScriptVersion       = '1.2.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -784,6 +784,11 @@ if ($Workload -contains 'Exchange') {
                         $rows.Add([pscustomobject]@{
                             Mailbox = $id; MailboxType = $m.RecipientTypeDetails
                             Permission = 'FullAccess'; Delegate = $_.User
+                            # EXO doesn't expose the AutoMapping flag for existing grants
+                            # (it lives in msExchDelegateListLink, not surfaced by cmdlets).
+                            # Per MS docs, individual FullAccess grants automap by default
+                            # unless -AutoMapping $false was used at grant time (undetectable).
+                            AutoMapping = 'On (default)'
                         })
                     }
                 } catch { }
@@ -795,6 +800,7 @@ if ($Workload -contains 'Exchange') {
                         $rows.Add([pscustomobject]@{
                             Mailbox = $id; MailboxType = $m.RecipientTypeDetails
                             Permission = 'SendAs'; Delegate = $_.Trustee
+                            AutoMapping = 'N/A'
                         })
                     }
                 } catch { }
@@ -804,6 +810,7 @@ if ($Workload -contains 'Exchange') {
                         $rows.Add([pscustomobject]@{
                             Mailbox = $id; MailboxType = $m.RecipientTypeDetails
                             Permission = 'SendOnBehalf'; Delegate = "$sob"
+                            AutoMapping = 'N/A'
                         })
                     }
                 }
@@ -813,6 +820,7 @@ if ($Workload -contains 'Exchange') {
         $collected['Delegation'] = $delegation
         if ($delegation) {
             Add-Summary 'Delegation grants (Full/SendAs/OnBehalf)' $delegation.Count
+            Add-Summary '  FullAccess grants (automap On by default)' (@($delegation | Where-Object { $_.Permission -eq 'FullAccess' }).Count)
             Add-Summary '  Mailboxes with delegation' (@($delegation | Select-Object -ExpandProperty Mailbox -Unique).Count)
         }
     }

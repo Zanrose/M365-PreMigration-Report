@@ -106,6 +106,14 @@ to the built-in map — it never aborts the run over license names.
   (explicit grants only — inherited rights and `NT AUTHORITY\SELF` are excluded). These
   permissions do **not** transfer in a tenant-to-tenant move and must be re-applied on the
   target. Skipped with `-SkipDelegation`; needs the same ExO connection as mailbox type.
+  - **AutoMapping** column: Exchange Online has no supported way to read the AutoMapping
+    flag for an *existing* FullAccess grant (it's stored in the mailbox's
+    `msExchDelegateListLink` attribute, which `Get-Mailbox`/`Get-EXOMailbox` don't return).
+    The column therefore reflects Microsoft's documented default — individual FullAccess
+    grants automap (`On (default)`), SendAs/SendOnBehalf are `N/A`. A grant created with
+    `-AutoMapping $false`, and FullAccess granted to a group (which never automaps), can't
+    be distinguished here. When rebuilding on the target, re-apply FullAccess with the
+    intended `-AutoMapping` value explicitly.
 - **MX / inbound filtering.** Each verified (non-`onmicrosoft.com`) domain is MX-resolved.
   If the lowest-preference host isn't `*.mail.protection.outlook.com`, `ThirdPartyInbound`
   is `True` and `Provider` names the likely gateway (Mimecast, Proofpoint, Barracuda, Cisco

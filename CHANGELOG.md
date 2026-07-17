@@ -3,6 +3,16 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.2.0] - 2026-07-17
+### Added
+- **Delegation `AutoMapping` column.** The Delegation sheet now flags automapping
+  for each grant. Exchange Online doesn't expose the AutoMapping flag for existing
+  FullAccess permissions (it's held in `msExchDelegateListLink`, which the mailbox
+  cmdlets don't return), so the value reflects Microsoft's documented default:
+  individual FullAccess grants show `On (default)`; SendAs/SendOnBehalf show `N/A`.
+  A `-AutoMapping $false` grant can't be distinguished via PowerShell. The Summary
+  now also counts FullAccess grants.
+
 ## [1.1.0] - 2026-07-17
 ### Added
 - **Self-update.** On start the script checks GitHub for a newer version — reading
