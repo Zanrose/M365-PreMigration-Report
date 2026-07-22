@@ -17,6 +17,8 @@
 | `Delegation`      | Exchange            | Exchange Online — FullAccess / SendAs / SendOnBehalf per mailbox |
 | `MailGroups`      | Exchange            | `/groups` (DLs / mail-enabled / M365) |
 | `MX-Records`      | Exchange            | DNS MX lookup per verified domain (inbound mail routing / 3rd-party filter) |
+| `PublicFolders`   | Exchange            | Exchange Online — folder tree, item count/size, mail-enabled SMTP/proxy addresses |
+| `PublicFolder-Permissions` | Exchange    | Exchange Online — per-folder client permissions (Owner/Editor/Reviewer/etc.) |
 | `SharePoint`      | SharePoint          | `getSharePointSiteUsageDetail` report |
 | `OneDrive`        | SharePoint          | `getOneDriveUsageAccountDetail` report |
 | `Teams-Groups`    | Teams               | `/groups` (Unified) + owner/member counts |
@@ -26,7 +28,7 @@
 - Windows PowerShell 5.1 or PowerShell 7+
 - Modules (auto-installed to CurrentUser if missing): `Microsoft.Graph.Authentication`,
   `ImportExcel`, and `ExchangeOnlineManagement` (only when the Exchange workload runs
-  without `-SkipMailboxType`)
+  without `-SkipMailboxType`, or without `-SkipPublicFolders`)
 - Graph permissions: `Organization.Read.All`, `User.Read.All`, `Group.Read.All`,
   `GroupMember.Read.All`, `Directory.Read.All`, `Sites.Read.All`, `Reports.Read.All`,
   `AuditLog.Read.All`, `Domain.Read.All`
@@ -53,8 +55,9 @@ so the script is portable across machines and users — no paths to edit. Overri
 
 Parameters: `-OutputPath`, `-TenantId`, `-Workload` (Identity/Exchange/SharePoint/Teams),
 `-UsagePeriod` (D7/D30/D90/D180), `-UseAppOnly` / `-ClientId` / `-CertificateThumbprint`,
-`-SkipModuleInstall`, `-SkipMailboxType`, `-SkipDelegation`, `-OfflineSkuNames`,
-`-SkuCatalogPath`, `-SkuCatalogUrl`, `-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
+`-SkipModuleInstall`, `-SkipMailboxType`, `-SkipDelegation`, `-SkipPublicFolders`,
+`-SkipPublicFolderPermissions`, `-OfflineSkuNames`, `-SkuCatalogPath`, `-SkuCatalogUrl`,
+`-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
 
 ## Self-update
 
@@ -114,6 +117,20 @@ to the built-in map — it never aborts the run over license names.
     `-AutoMapping $false`, and FullAccess granted to a group (which never automaps), can't
     be distinguished here. When rebuilding on the target, re-apply FullAccess with the
     intended `-AutoMapping` value explicitly.
+- **Public folders.** The Exchange workload also connects to Exchange Online to walk the
+  public folder tree (`Get-PublicFolder -Recurse`), pull per-folder item count/size
+  (`Get-PublicFolderStatistics`), and match mail-enabled folders to their SMTP/proxy
+  addresses (`Get-MailPublicFolder`). Public folders have **no native tenant-to-tenant
+  migration path**, so the `PublicFolders` sheet is the inventory a migration team works
+  from to plan content migration and to recreate mail-enabled addresses on the target.
+  Client permissions (Owner/Editor/Reviewer/etc.) are collected per folder into a
+  separate `PublicFolder-Permissions` sheet — these also don't transfer and must be
+  re-applied on the target. If the tenant has public folders disabled, both sheets are
+  skipped and the Summary notes "Public folders enabled: No". Use `-SkipPublicFolders`
+  to skip both sheets entirely, or `-SkipPublicFolderPermissions` to keep the folder
+  inventory but skip the (slower, one-call-per-folder) permissions sheet. Unlike
+  Delegation, public folder discovery runs even when `-SkipMailboxType` is used, since
+  it only needs the Exchange Online connection, not the mailbox list.
 - **MX / inbound filtering.** Each verified (non-`onmicrosoft.com`) domain is MX-resolved.
   If the lowest-preference host isn't `*.mail.protection.outlook.com`, `ThirdPartyInbound`
   is `True` and `Provider` names the likely gateway (Mimecast, Proofpoint, Barracuda, Cisco

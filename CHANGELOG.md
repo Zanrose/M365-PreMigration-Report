@@ -3,6 +3,22 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.3.0] - 2026-07-22
+### Added
+- **Public folder discovery.** New `PublicFolders` sheet inventories the public
+  folder tree via Exchange Online (`Get-PublicFolder -Recurse`), with per-folder
+  item count/size (`Get-PublicFolderStatistics`) and mail-enabled SMTP/proxy
+  addresses (`Get-MailPublicFolder`) — public folders have no native
+  tenant-to-tenant migration path, so this is the inventory a migration team
+  plans content migration from. A new `PublicFolder-Permissions` sheet captures
+  per-folder client permissions (Owner/Editor/Reviewer/etc.), which also don't
+  transfer and must be re-applied on the target. New switches:
+  `-SkipPublicFolders` (skips both sheets) and `-SkipPublicFolderPermissions`
+  (keeps the folder inventory, skips the slower one-call-per-folder permissions
+  sheet). Public folder discovery runs even with `-SkipMailboxType`, since it
+  only needs the Exchange Online connection, not the mailbox list. The Summary
+  tab notes whether public folders are enabled for the tenant.
+
 ## [1.2.0] - 2026-07-17
 ### Added
 - **Delegation `AutoMapping` column.** The Delegation sheet now flags automapping

@@ -49,6 +49,15 @@
 .PARAMETER SkipModuleInstall
     Don't attempt to install missing modules; fail instead.
 
+.PARAMETER SkipPublicFolders
+    Skip public folder discovery (folder tree, item counts/size, mail-enabled
+    addresses). Requires the same Exchange Online connection as mailbox type /
+    delegation, and runs even if -SkipMailboxType is passed.
+
+.PARAMETER SkipPublicFolderPermissions
+    Skip the public folder client-permissions sheet (one call per folder) while
+    still collecting the folder inventory itself.
+
 .EXAMPLE
     .\New-M365PreMigrationReport.ps1
     Interactive sign-in, all workloads, report dropped next to the script.
@@ -100,6 +109,16 @@ param(
     # per mailbox, so use -SkipDelegation on very large tenants to skip that sheet.
     [switch]$SkipDelegation,
 
+    # Public folder discovery (folder tree, item counts/size, mail-enabled
+    # addresses) via Exchange Online. Runs even if -SkipMailboxType is used,
+    # since it only needs the ExO connection, not the mailbox list.
+    [switch]$SkipPublicFolders,
+
+    # Public folder client permissions (Owner/Editor/Reviewer per folder) are
+    # one call per folder, so use -SkipPublicFolderPermissions on large PF
+    # trees to skip just that sheet while still getting the folder inventory.
+    [switch]$SkipPublicFolderPermissions,
+
     # License friendly-name catalog. By default the script downloads Microsoft's
     # published "Product names and service plan identifiers" CSV. Use
     # -OfflineSkuNames to skip the download (built-in map only), or -SkuCatalogPath
@@ -123,7 +142,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.2.0'
+$ScriptVersion       = '1.3.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -706,13 +725,15 @@ if ($Workload -contains 'Exchange') {
     # Mailbox type (User/Shared/Room/Equipment) isn't exposed by Graph, so connect
     # to Exchange Online and build a UPN/SMTP -> RecipientTypeDetails lookup.
     # Best-effort: any failure leaves the type as "Unknown" rather than aborting.
+    # The same connection also feeds Delegation and Public Folders below, so it's
+    # established whenever any of those three are wanted, not just mailbox type.
     $mbxTypeMap = @{}
     $exoMailboxes = @()
-    if (-not $SkipMailboxType) {
+    if (-not $SkipMailboxType -or -not $SkipPublicFolders) {
         try {
             Initialize-Module -Name 'ExchangeOnlineManagement'
             Import-Module ExchangeOnlineManagement -ErrorAction Stop
-            Write-Step "Connecting to Exchange Online (for mailbox type)..." 'INFO'
+            Write-Step "Connecting to Exchange Online..." 'INFO'
             if ($UseAppOnly) {
                 $exoOrg = if ($org -and $org[0].InitialDomain) { $org[0].InitialDomain }
                           elseif ($TenantId) { $TenantId } else { $ctx.TenantId }
@@ -722,17 +743,20 @@ if ($Workload -contains 'Exchange') {
                 Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
             }
             $script:ExoConnected = $true
-            Write-Step "  -> retrieving mailboxes..." 'INFO'
-            $exoMailboxes = @(Get-EXOMailbox -ResultSize Unlimited `
-                -Properties RecipientTypeDetails, GrantSendOnBehalfTo -ErrorAction Stop)
-            foreach ($m in $exoMailboxes) {
-                if ($m.UserPrincipalName)  { $mbxTypeMap[("$($m.UserPrincipalName)").ToLower()]  = $m.RecipientTypeDetails }
-                if ($m.PrimarySmtpAddress) { $mbxTypeMap[("$($m.PrimarySmtpAddress)").ToLower()] = $m.RecipientTypeDetails }
+
+            if (-not $SkipMailboxType) {
+                Write-Step "  -> retrieving mailboxes..." 'INFO'
+                $exoMailboxes = @(Get-EXOMailbox -ResultSize Unlimited `
+                    -Properties RecipientTypeDetails, GrantSendOnBehalfTo -ErrorAction Stop)
+                foreach ($m in $exoMailboxes) {
+                    if ($m.UserPrincipalName)  { $mbxTypeMap[("$($m.UserPrincipalName)").ToLower()]  = $m.RecipientTypeDetails }
+                    if ($m.PrimarySmtpAddress) { $mbxTypeMap[("$($m.PrimarySmtpAddress)").ToLower()] = $m.RecipientTypeDetails }
+                }
+                Write-Step "  -> $($exoMailboxes.Count) mailboxes, $($mbxTypeMap.Count) identities mapped" 'OK'
             }
-            Write-Step "  -> $($exoMailboxes.Count) mailboxes, $($mbxTypeMap.Count) identities mapped" 'OK'
         } catch {
             Write-Step "  -> Exchange Online unavailable: $($_.Exception.Message)" 'WARN'
-            Write-Step "     MailboxType will read 'Unknown'. Re-run without -SkipMailboxType once ExO is reachable." 'WARN'
+            Write-Step "     MailboxType/Delegation/PublicFolders will be limited. Re-run once ExO is reachable." 'WARN'
         }
     }
 
@@ -823,6 +847,93 @@ if ($Workload -contains 'Exchange') {
             Add-Summary '  FullAccess grants (automap On by default)' (@($delegation | Where-Object { $_.Permission -eq 'FullAccess' }).Count)
             Add-Summary '  Mailboxes with delegation' (@($delegation | Select-Object -ExpandProperty Mailbox -Unique).Count)
         }
+    }
+
+    # Public folders: content and structure that has no native tenant-to-tenant
+    # migration path, so the tree, sizing, and mail-enabled addresses all need
+    # to be known up front. Mail-enabled folders carry SMTP/proxy addresses that
+    # must exist on the target before mail flow to them works there.
+    if (-not $SkipPublicFolders -and $script:ExoConnected) {
+        $pfEnabled = $null
+        try { $pfEnabled = "$((Get-OrganizationConfig -ErrorAction Stop).PublicFoldersEnabled)" } catch { }
+
+        if ($pfEnabled -eq 'None' -or [string]::IsNullOrWhiteSpace($pfEnabled)) {
+            Write-Step "Public folders: not enabled for this tenant" 'INFO'
+            Add-Summary 'Public folders enabled' 'No'
+        } else {
+            Add-Summary 'Public folders enabled' "Yes ($pfEnabled)"
+
+            # Mail-enabled folders, keyed by the GUID that links them back to the
+            # folder object (Get-PublicFolder.MailRecipientGuid).
+            $mailPfMap = @{}
+            try {
+                Get-MailPublicFolder -ResultSize Unlimited -ErrorAction Stop | ForEach-Object {
+                    if ($_.Guid) { $mailPfMap[$_.Guid.ToString()] = $_ }
+                }
+            } catch { }
+
+            $statsMap = @{}
+            try {
+                Get-PublicFolderStatistics -ResultSize Unlimited -ErrorAction Stop | ForEach-Object {
+                    $statsMap[$_.FolderPath] = $_
+                }
+            } catch { }
+
+            $pfFolders = Invoke-Collection 'Public folders' {
+                Get-PublicFolder -Identity '\' -Recurse -ResultSize Unlimited -ErrorAction Stop |
+                    ForEach-Object {
+                        $stat   = $statsMap[$_.FolderPath]
+                        $mailPf = if ($_.MailEnabled -and $_.MailRecipientGuid) { $mailPfMap[$_.MailRecipientGuid.ToString()] } else { $null }
+                        $sizeGb = 0
+                        if ($stat -and $stat.TotalItemSize) {
+                            try { $sizeGb = Format-Gb $stat.TotalItemSize.Value.ToBytes() } catch { }
+                        }
+                        [pscustomobject]@{
+                            FolderPath         = $_.FolderPath
+                            MailEnabled        = [bool]$_.MailEnabled
+                            HasSubfolders      = [bool]$_.HasSubfolders
+                            ItemCount          = if ($stat) { [int64]$stat.ItemCount } else { 0 }
+                            SizeGB             = $sizeGb
+                            LastModified       = if ($stat) { $stat.LastModificationTime } else { $null }
+                            PrimarySmtpAddress = if ($mailPf) { $mailPf.PrimarySmtpAddress } else { $null }
+                            EmailAddresses     = if ($mailPf) { ($mailPf.EmailAddresses -join '; ') } else { $null }
+                        }
+                    }
+            }
+            $collected['PublicFolders'] = $pfFolders
+            if ($pfFolders) {
+                $mailEnabledPf = @($pfFolders | Where-Object MailEnabled)
+                Add-Summary 'Public folders'                $pfFolders.Count
+                Add-Summary '  Mail-enabled public folders' $mailEnabledPf.Count
+                Add-Summary 'Public folder storage (GB)'    ([math]::Round((($pfFolders | Measure-Object SizeGB -Sum).Sum), 2))
+            }
+
+            # Client permissions (Owner/Editor/Reviewer/etc.) don't transfer in a
+            # tenant-to-tenant move either, and must be re-applied on the target.
+            if (-not $SkipPublicFolderPermissions -and $pfFolders.Count) {
+                $pfPerms = Invoke-Collection 'Public folder client permissions' {
+                    $rows = [System.Collections.Generic.List[object]]::new()
+                    foreach ($f in $pfFolders) {
+                        try {
+                            Get-PublicFolderClientPermission -Identity $f.FolderPath -ErrorAction Stop | ForEach-Object {
+                                foreach ($right in @($_.AccessRights)) {
+                                    $rows.Add([pscustomobject]@{
+                                        FolderPath  = $f.FolderPath
+                                        User        = "$($_.User)"
+                                        AccessRight = $right
+                                    })
+                                }
+                            }
+                        } catch { }
+                    }
+                    $rows
+                }
+                $collected['PublicFolder-Permissions'] = $pfPerms
+                if ($pfPerms) { Add-Summary 'Public folder permission grants' $pfPerms.Count }
+            }
+        }
+    } elseif (-not $SkipPublicFolders) {
+        Write-Step "Public folders: skipped (Exchange Online not connected)" 'WARN'
     }
 
     # Distribution lists / mail-enabled groups (Graph).
