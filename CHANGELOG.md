@@ -3,6 +3,19 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.3.1] - 2026-07-22
+### Fixed
+- **Public folder `FolderPath` was unusable.** Exchange Online's V3 module returns
+  `Get-PublicFolder`/`Get-PublicFolderStatistics`'s `FolderPath` as an array of path
+  segments, not a single string like the classic module. Used as-is, this made the
+  `PublicFolders` sheet's `FolderPath` column print the literal type name
+  (`System.Collections.ArrayList`) and silently broke the stats/mail-enabled
+  lookups (an ArrayList has no value-based equality, so the dictionary keyed by it
+  never matched), leaving `ItemCount`, `SizeGB`, `LastModified`,
+  `PrimarySmtpAddress`, and `EmailAddresses` blank for every row. Added
+  `Get-PfPathString` to normalize the value to `\Segment1\Segment2` before it's
+  used as a column or a lookup key.
+
 ## [1.3.0] - 2026-07-22
 ### Added
 - **Public folder discovery.** New `PublicFolders` sheet inventories the public

@@ -142,7 +142,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.3.0'
+$ScriptVersion       = '1.3.1'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -368,6 +368,18 @@ function Get-GraphUsageReport {
 }
 
 function Format-Gb { param($Bytes) if ($null -eq $Bytes -or $Bytes -eq '') { 0 } else { [math]::Round([double]$Bytes / 1GB, 2) } }
+
+# Get-PublicFolder / Get-PublicFolderStatistics (Exchange Online V3 module) return
+# FolderPath as an array of path segments rather than a single delimited string
+# like the classic module did. Normalize to "\Segment1\Segment2" either way, since
+# using the raw array as an export column or a dictionary key silently breaks both
+# (ArrayList has no useful ToString() and no value-based equality).
+function Get-PfPathString {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return $Value }
+    return '\' + ((@($Value) | Where-Object { $_ }) -join '\')
+}
 
 # Download (or load) Microsoft's licensing CSV and return skuPartNumber/skuId ->
 # friendly-name lookups. The CSV has one row per service plan, so we de-dupe to
@@ -875,21 +887,22 @@ if ($Workload -contains 'Exchange') {
             $statsMap = @{}
             try {
                 Get-PublicFolderStatistics -ResultSize Unlimited -ErrorAction Stop | ForEach-Object {
-                    $statsMap[$_.FolderPath] = $_
+                    $statsMap[(Get-PfPathString $_.FolderPath)] = $_
                 }
             } catch { }
 
             $pfFolders = Invoke-Collection 'Public folders' {
                 Get-PublicFolder -Identity '\' -Recurse -ResultSize Unlimited -ErrorAction Stop |
                     ForEach-Object {
-                        $stat   = $statsMap[$_.FolderPath]
+                        $folderPath = Get-PfPathString $_.FolderPath
+                        $stat   = $statsMap[$folderPath]
                         $mailPf = if ($_.MailEnabled -and $_.MailRecipientGuid) { $mailPfMap[$_.MailRecipientGuid.ToString()] } else { $null }
                         $sizeGb = 0
                         if ($stat -and $stat.TotalItemSize) {
                             try { $sizeGb = Format-Gb $stat.TotalItemSize.Value.ToBytes() } catch { }
                         }
                         [pscustomobject]@{
-                            FolderPath         = $_.FolderPath
+                            FolderPath         = $folderPath
                             MailEnabled        = [bool]$_.MailEnabled
                             HasSubfolders      = [bool]$_.HasSubfolders
                             ItemCount          = if ($stat) { [int64]$stat.ItemCount } else { 0 }
