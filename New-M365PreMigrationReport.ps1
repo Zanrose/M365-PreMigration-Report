@@ -142,7 +142,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.3.1'
+$ScriptVersion       = '1.4.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -521,12 +521,18 @@ $org = Invoke-Collection 'Tenant overview' {
     $resp    = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization'
     $o       = @($resp.value)[0]
     $domains = @($o.verifiedDomains)
+    # Split verified domains into onmicrosoft.com (tenant-issued, carries no
+    # branding) vs vanity/custom domains (the ones that need re-verifying and
+    # re-pointing on the target tenant during a tenant-to-tenant cutover).
+    $onMicrosoftDomains = @($domains | Where-Object { $_.name -like '*.onmicrosoft.com' } | Select-Object -ExpandProperty name)
+    $vanityDomains      = @($domains | Where-Object { $_.name -notlike '*.onmicrosoft.com' } | Select-Object -ExpandProperty name)
     [pscustomobject]@{
         DisplayName        = $o.displayName
         TenantId           = $o.id
         DefaultDomain      = ($domains | Where-Object { $_.isDefault }).name
         InitialDomain      = ($domains | Where-Object { $_.name -like '*.onmicrosoft.com' } | Select-Object -First 1).name
-        VerifiedDomains    = ($domains.name -join '; ')
+        OnMicrosoftDomains = ($onMicrosoftDomains -join '; ')
+        VanityDomains      = ($vanityDomains -join '; ')
         Country            = $o.countryLetterCode
         CreatedDateTime    = $o.createdDateTime
         OnPremisesSyncEnabled = $o.onPremisesSyncEnabled
@@ -976,8 +982,8 @@ if ($Workload -contains 'Exchange') {
     $mxRows = Invoke-Collection 'MX / inbound mail routing' {
         $rows = [System.Collections.Generic.List[object]]::new()
         $domainList = @()
-        if ($org -and $org[0].VerifiedDomains) { $domainList = $org[0].VerifiedDomains -split '\s*;\s*' }
-        $domainList = $domainList | Where-Object { $_ -and $_ -notlike '*.onmicrosoft.com' } | Sort-Object -Unique
+        if ($org -and $org[0].VanityDomains) { $domainList = $org[0].VanityDomains -split '\s*;\s*' }
+        $domainList = $domainList | Where-Object { $_ } | Sort-Object -Unique
         foreach ($d in $domainList) {
             try {
                 $recs = @(Resolve-DnsName -Name $d -Type MX -ErrorAction Stop |

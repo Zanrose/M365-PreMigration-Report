@@ -3,6 +3,16 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.4.0] - 2026-07-23
+### Changed
+- **Tenant sheet: domains split by type.** The single `VerifiedDomains` column
+  is now two columns, `OnMicrosoftDomains` and `VanityDomains` — the latter is
+  the list that actually needs re-verifying and re-pointing on the target
+  tenant during a tenant-to-tenant cutover, so it's no longer buried in a mixed
+  list with the tenant-issued `.onmicrosoft.com` domains. The MX / inbound mail
+  routing lookup now reads `VanityDomains` directly instead of filtering out
+  `.onmicrosoft.com` from the old combined list.
+
 ## [1.3.1] - 2026-07-22
 ### Fixed
 - **Public folder `FolderPath` was unusable.** Exchange Online's V3 module returns
