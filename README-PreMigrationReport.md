@@ -55,9 +55,20 @@ so the script is portable across machines and users — no paths to edit. Overri
 
 Parameters: `-OutputPath`, `-TenantId`, `-Workload` (Identity/Exchange/SharePoint/Teams),
 `-UsagePeriod` (D7/D30/D90/D180), `-UseAppOnly` / `-ClientId` / `-CertificateThumbprint`,
-`-SkipModuleInstall`, `-SkipMailboxType`, `-SkipDelegation`, `-SkipPublicFolders`,
-`-SkipPublicFolderPermissions`, `-OfflineSkuNames`, `-SkuCatalogPath`, `-SkuCatalogUrl`,
-`-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
+`-SkipModuleInstall`, `-SkipLogFile`, `-SkipMailboxType`, `-SkipDelegation`,
+`-SkipPublicFolders`, `-SkipPublicFolderPermissions`, `-OfflineSkuNames`,
+`-SkuCatalogPath`, `-SkuCatalogUrl`, `-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
+
+## Logging
+
+By default the full console output of the run (every step, warning, and error) is also
+written to a timestamped `New-M365PreMigrationReport_<yyyy-MM-dd_HHmmss>.log` file in the
+**same folder as the script** — separate from the `.xlsx` report, which still goes to
+Documents. This is a plain `Start-Transcript`, so it captures everything printed to the
+console, not just the summarized steps. Pass `-SkipLogFile` to turn it off (e.g. if the
+script folder is read-only). If the log can't be started (transcription already active in
+the session, read-only folder, etc.) the script logs a warning and continues without a
+log file rather than aborting the run.
 
 ## Self-update
 

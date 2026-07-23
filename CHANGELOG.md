@@ -3,6 +3,16 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.5.0] - 2026-07-23
+### Added
+- **Log file.** The full console output of the run is now also written to a
+  timestamped `New-M365PreMigrationReport_<yyyy-MM-dd_HHmmss>.log` file in the
+  same folder as the script (via `Start-Transcript`), separate from the
+  `.xlsx` report. New `-SkipLogFile` switch to disable it. If the transcript
+  can't be started, the script warns and continues without a log file instead
+  of aborting the run; the self-update exit path stops the transcript cleanly
+  before restarting.
+
 ## [1.4.0] - 2026-07-23
 ### Changed
 - **Tenant sheet: domains split by type.** The single `VerifiedDomains` column

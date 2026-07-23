@@ -58,6 +58,10 @@
     Skip the public folder client-permissions sheet (one call per folder) while
     still collecting the folder inventory itself.
 
+.PARAMETER SkipLogFile
+    Don't write a transcript log file. By default the full console output of the
+    run is also written to a timestamped .log file next to the script.
+
 .EXAMPLE
     .\New-M365PreMigrationReport.ps1
     Interactive sign-in, all workloads, report dropped next to the script.
@@ -97,6 +101,11 @@ param(
     [string]$CertificateThumbprint,
 
     [switch]$SkipModuleInstall,
+
+    # By default the full console output of the run is also written to a
+    # timestamped .log file next to the script (via Start-Transcript). Use
+    # -SkipLogFile to skip that (e.g. read-only script folder).
+    [switch]$SkipLogFile,
 
     # Mailbox type (User/Shared/Room/Equipment) is not available from Graph, so by
     # default the Exchange workload also connects to Exchange Online PowerShell to
@@ -142,11 +151,30 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.4.0'
+$ScriptVersion       = '1.5.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
 $script:ScriptFileName = 'New-M365PreMigrationReport.ps1'
+
+# ---------------------------------------------------------------------------
+# Log file (full console transcript, written next to the script)
+# ---------------------------------------------------------------------------
+$script:LogFile      = $null
+$script:LogFileError = $null
+if (-not $SkipLogFile) {
+    $logDir = if ($PSScriptRoot) { $PSScriptRoot }
+              elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
+              else { (Get-Location).Path }
+    $script:LogFile = Join-Path $logDir ("New-M365PreMigrationReport_{0:yyyy-MM-dd_HHmmss}.log" -f $script:StartTime)
+    try {
+        Start-Transcript -Path $script:LogFile -ErrorAction Stop | Out-Null
+    } catch {
+        # Write-Step isn't defined yet; the error is surfaced once it is, below.
+        $script:LogFileError = $_.Exception.Message
+        $script:LogFile      = $null
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -239,6 +267,7 @@ function Install-ScriptUpdate {
         Set-Content -LiteralPath $target -Value $NewContent -Encoding UTF8
         Write-Step "Updated to v$NewVersion. Backup: $(Split-Path $backup -Leaf)" 'OK'
         Write-Step "Please re-run the script to use the new version." 'OK'
+        if ($script:LogFile) { try { Stop-Transcript | Out-Null } catch { } }
         exit 0
     } catch {
         Write-Step "Update failed while writing the file: $($_.Exception.Message)" 'ERROR'
@@ -455,6 +484,8 @@ function Resolve-SkuName {
 # ---------------------------------------------------------------------------
 
 Write-Step "M365 Pre-Migration Report (v$ScriptVersion)" 'INFO'
+if ($script:LogFile) { Write-Step "Logging to: $script:LogFile" 'INFO' }
+elseif ($script:LogFileError) { Write-Step "Log file not started: $script:LogFileError" 'WARN' }
 Write-Step "Workloads: $($Workload -join ', ')  |  Usage period: $UsagePeriod" 'INFO'
 
 # Check for a newer version before doing any work (may prompt / self-update / exit).
@@ -1142,3 +1173,5 @@ Write-Step "Worksheets: Summary, $($collected.Keys -join ', ')" 'INFO'
 
 try { Disconnect-MgGraph | Out-Null } catch { }
 if ($script:ExoConnected) { try { Disconnect-ExchangeOnline -Confirm:$false | Out-Null } catch { } }
+
+if ($script:LogFile) { try { Stop-Transcript | Out-Null } catch { } }
