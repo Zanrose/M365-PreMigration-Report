@@ -3,6 +3,21 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.5.1] - 2026-07-23
+### Fixed
+- **Usage reports (Mailbox/SharePoint/OneDrive) failing with `Forbidden
+  (InvalidDownloadToken)` or "too many retries".** `Get-GraphUsageReport` used
+  a raw `Invoke-MgGraphRequest -OutputFilePath` call against the reports URI.
+  Those endpoints 302-redirect to a pre-signed storage URL, and
+  `Invoke-MgGraphRequest` can forward the Graph bearer token onto that
+  redirect, which the storage endpoint rejects — observed as an immediate
+  `Forbidden (InvalidDownloadToken)` for SharePoint/OneDrive, and as a multi-
+  minute retry loop ending in "Too many retries performed" for Mailbox usage.
+  Switched to the typed `Get-MgReportMailboxUsageDetail` /
+  `Get-MgReportOneDriveUsageAccountDetail` / `Get-MgReportSharePointSiteUsageDetail`
+  cmdlets (`Microsoft.Graph.Reports` module, now auto-installed when the
+  Exchange or SharePoint workload runs), which handle the redirect correctly.
+
 ## [1.5.0] - 2026-07-23
 ### Added
 - **Log file.** The full console output of the run is now also written to a

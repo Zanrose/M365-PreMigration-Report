@@ -27,8 +27,9 @@
 
 - Windows PowerShell 5.1 or PowerShell 7+
 - Modules (auto-installed to CurrentUser if missing): `Microsoft.Graph.Authentication`,
-  `ImportExcel`, and `ExchangeOnlineManagement` (only when the Exchange workload runs
-  without `-SkipMailboxType`, or without `-SkipPublicFolders`)
+  `ImportExcel`, `Microsoft.Graph.Reports` (only when the Exchange or SharePoint workload
+  runs, for the usage-report sizing sheets), and `ExchangeOnlineManagement` (only when the
+  Exchange workload runs without `-SkipMailboxType`, or without `-SkipPublicFolders`)
 - Graph permissions: `Organization.Read.All`, `User.Read.All`, `Group.Read.All`,
   `GroupMember.Read.All`, `Directory.Read.All`, `Sites.Read.All`, `Reports.Read.All`,
   `AuditLog.Read.All`, `Domain.Read.All`

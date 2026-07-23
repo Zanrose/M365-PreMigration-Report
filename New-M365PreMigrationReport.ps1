@@ -151,7 +151,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.5.0'
+$ScriptVersion       = '1.5.1'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -380,13 +380,26 @@ function Invoke-Collection {
     }
 }
 
-# Download a Graph usage report CSV and return it as objects.
+# Download a Graph usage report CSV and return it as objects. Uses the typed
+# Microsoft.Graph.Reports cmdlets rather than a raw Invoke-MgGraphRequest
+# -OutputFilePath call against the reports URI: the usage-report endpoints
+# 302-redirect to a pre-signed storage URL, and Invoke-MgGraphRequest can
+# forward the Graph bearer token onto that redirect, which the storage
+# endpoint then rejects with "Forbidden (InvalidDownloadToken)" (and, in at
+# least one observed case, retries itself into "Too many retries performed"
+# instead of failing fast). The dedicated cmdlets handle that redirect
+# correctly.
 function Get-GraphUsageReport {
     param([string]$ReportName, [string]$Period)
+    $cmdlet = switch ($ReportName) {
+        'getMailboxUsageDetail'         { 'Get-MgReportMailboxUsageDetail' }
+        'getOneDriveUsageAccountDetail' { 'Get-MgReportOneDriveUsageAccountDetail' }
+        'getSharePointSiteUsageDetail'  { 'Get-MgReportSharePointSiteUsageDetail' }
+        default { throw "Unknown usage report '$ReportName'." }
+    }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("graphrpt_{0}_{1}.csv" -f $ReportName, [guid]::NewGuid())
-    $uri = "https://graph.microsoft.com/v1.0/reports/$ReportName(period='$Period')"
     try {
-        Invoke-MgGraphRequest -Method GET -Uri $uri -OutputFilePath $tmp | Out-Null
+        & $cmdlet -Period $Period -OutFile $tmp | Out-Null
         if (Test-Path $tmp) {
             return Import-Csv -Path $tmp
         }
@@ -495,6 +508,12 @@ Initialize-Module -Name 'Microsoft.Graph.Authentication'
 Initialize-Module -Name 'ImportExcel'
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 Import-Module ImportExcel -ErrorAction Stop
+
+# Only needed for the usage-report cmdlets (Mailbox/SharePoint/OneDrive sizing).
+if ($Workload -contains 'Exchange' -or $Workload -contains 'SharePoint') {
+    Initialize-Module -Name 'Microsoft.Graph.Reports'
+    Import-Module Microsoft.Graph.Reports -ErrorAction Stop
+}
 
 $scopes = @(
     'Organization.Read.All', 'User.Read.All', 'Group.Read.All', 'GroupMember.Read.All',
