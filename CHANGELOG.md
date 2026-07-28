@@ -3,6 +3,17 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.6.0] - 2026-07-23
+### Added
+- **Archive mailbox detection and usage.** The Mailboxes sheet now flags
+  `HasArchive`, `ArchiveStatus`, and `AutoExpandingArchive` per mailbox (from
+  the existing `Get-EXOMailbox` call used for mailbox type — no extra calls).
+  A new `Archive-Mailboxes` sheet collects real per-archive item count and
+  size via `Get-EXOMailboxStatistics -Archive` for every archive-enabled
+  mailbox. New `-SkipArchiveStats` switch to skip that sheet on large tenants
+  (the Mailboxes sheet still shows `HasArchive` either way). Summary now
+  counts mailboxes with an archive enabled and total archive storage.
+
 ## [1.5.1] - 2026-07-23
 ### Fixed
 - **Usage reports (Mailbox/SharePoint/OneDrive) failing with `Forbidden

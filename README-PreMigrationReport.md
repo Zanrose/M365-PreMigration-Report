@@ -13,7 +13,8 @@
 | `Users`           | Identity            | `/users` (incl. per-user licenses, dir-sync, guest/member) |
 | `MFA-Registration`| Identity            | `/reports/authenticationMethods/userRegistrationDetails` |
 | `Domains`         | Identity            | `/domains` (+ `federationConfiguration`) — Managed vs Federated |
-| `Mailboxes`       | Exchange            | `getMailboxUsageDetail` report + Exchange Online (`Get-EXOMailbox`) for mailbox type |
+| `Mailboxes`       | Exchange            | `getMailboxUsageDetail` report + Exchange Online (`Get-EXOMailbox`) for mailbox type + archive flag |
+| `Archive-Mailboxes` | Exchange          | Exchange Online (`Get-EXOMailboxStatistics -Archive`) — per-archive item count/size |
 | `Delegation`      | Exchange            | Exchange Online — FullAccess / SendAs / SendOnBehalf per mailbox |
 | `MailGroups`      | Exchange            | `/groups` (DLs / mail-enabled / M365) |
 | `MX-Records`      | Exchange            | DNS MX lookup per verified domain (inbound mail routing / 3rd-party filter) |
@@ -57,8 +58,9 @@ so the script is portable across machines and users — no paths to edit. Overri
 Parameters: `-OutputPath`, `-TenantId`, `-Workload` (Identity/Exchange/SharePoint/Teams),
 `-UsagePeriod` (D7/D30/D90/D180), `-UseAppOnly` / `-ClientId` / `-CertificateThumbprint`,
 `-SkipModuleInstall`, `-SkipLogFile`, `-SkipMailboxType`, `-SkipDelegation`,
-`-SkipPublicFolders`, `-SkipPublicFolderPermissions`, `-OfflineSkuNames`,
-`-SkuCatalogPath`, `-SkuCatalogUrl`, `-SkipUpdateCheck`, `-AutoUpdate`, `-UpdateToken`.
+`-SkipArchiveStats`, `-SkipPublicFolders`, `-SkipPublicFolderPermissions`,
+`-OfflineSkuNames`, `-SkuCatalogPath`, `-SkuCatalogUrl`, `-SkipUpdateCheck`,
+`-AutoUpdate`, `-UpdateToken`.
 
 ## Logging
 
@@ -117,6 +119,14 @@ to the built-in map — it never aborts the run over license names.
   Pass `-SkipMailboxType` to skip it and stay pure-Graph — `MailboxType` then reads
   "Unknown (skipped)". If the ExO connection fails, the run continues and the type reads
   "Unknown".
+- **Archive mailboxes.** The Graph usage report only sizes the primary mailbox, so the
+  Exchange workload also flags `HasArchive` / `ArchiveStatus` / `AutoExpandingArchive` on
+  the Mailboxes sheet (from the same `Get-EXOMailbox` call as mailbox type — no extra
+  calls) and, for every archive-enabled mailbox, collects real archive item count/size into
+  a separate `Archive-Mailboxes` sheet via `Get-EXOMailboxStatistics -Archive` (one call per
+  archive-enabled mailbox). Archive content and the auto-expanding archive setting do **not**
+  carry over automatically in a tenant-to-tenant move and need their own migration/rebuild
+  plan. Skipped with `-SkipArchiveStats`; needs the same ExO connection as mailbox type.
 - **Delegation.** FullAccess / SendAs / SendOnBehalf grants are inventoried per mailbox
   (explicit grants only — inherited rights and `NT AUTHORITY\SELF` are excluded). These
   permissions do **not** transfer in a tenant-to-tenant move and must be re-applied on the

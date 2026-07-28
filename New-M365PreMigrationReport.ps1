@@ -58,6 +58,11 @@
     Skip the public folder client-permissions sheet (one call per folder) while
     still collecting the folder inventory itself.
 
+.PARAMETER SkipArchiveStats
+    Skip the per-mailbox archive size/item-count sheet (one call per
+    archive-enabled mailbox). The Mailboxes sheet still shows whether each
+    mailbox has an archive enabled, just not its size.
+
 .PARAMETER SkipLogFile
     Don't write a transcript log file. By default the full console output of the
     run is also written to a timestamped .log file next to the script.
@@ -118,6 +123,11 @@ param(
     # per mailbox, so use -SkipDelegation on very large tenants to skip that sheet.
     [switch]$SkipDelegation,
 
+    # Per-mailbox archive size/item count (Get-EXOMailboxStatistics -Archive) is
+    # one call per archive-enabled mailbox. Use -SkipArchiveStats on very large
+    # tenants to skip that sheet; the Mailboxes sheet still flags HasArchive.
+    [switch]$SkipArchiveStats,
+
     # Public folder discovery (folder tree, item counts/size, mail-enabled
     # addresses) via Exchange Online. Runs even if -SkipMailboxType is used,
     # since it only needs the ExO connection, not the mailbox list.
@@ -151,7 +161,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.5.1'
+$ScriptVersion       = '1.6.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -795,8 +805,9 @@ if ($Workload -contains 'Exchange') {
     # Best-effort: any failure leaves the type as "Unknown" rather than aborting.
     # The same connection also feeds Delegation and Public Folders below, so it's
     # established whenever any of those three are wanted, not just mailbox type.
-    $mbxTypeMap = @{}
-    $exoMailboxes = @()
+    $mbxTypeMap    = @{}
+    $archiveInfoMap = @{}
+    $exoMailboxes  = @()
     if (-not $SkipMailboxType -or -not $SkipPublicFolders) {
         try {
             Initialize-Module -Name 'ExchangeOnlineManagement'
@@ -814,25 +825,40 @@ if ($Workload -contains 'Exchange') {
 
             if (-not $SkipMailboxType) {
                 Write-Step "  -> retrieving mailboxes..." 'INFO'
-                $exoMailboxes = @(Get-EXOMailbox -ResultSize Unlimited `
-                    -Properties RecipientTypeDetails, GrantSendOnBehalfTo -ErrorAction Stop)
+                $exoMailboxes = @(Get-EXOMailbox -ResultSize Unlimited -Properties RecipientTypeDetails, `
+                    GrantSendOnBehalfTo, ArchiveStatus, ArchiveGuid, AutoExpandingArchiveEnabled -ErrorAction Stop)
                 foreach ($m in $exoMailboxes) {
-                    if ($m.UserPrincipalName)  { $mbxTypeMap[("$($m.UserPrincipalName)").ToLower()]  = $m.RecipientTypeDetails }
-                    if ($m.PrimarySmtpAddress) { $mbxTypeMap[("$($m.PrimarySmtpAddress)").ToLower()] = $m.RecipientTypeDetails }
+                    $hasArchive = [bool]($m.ArchiveStatus -and $m.ArchiveStatus -ne 'None')
+                    $archiveInfo = [pscustomobject]@{
+                        HasArchive                  = $hasArchive
+                        ArchiveStatus               = "$($m.ArchiveStatus)"
+                        AutoExpandingArchiveEnabled  = [bool]$m.AutoExpandingArchiveEnabled
+                    }
+                    if ($m.UserPrincipalName) {
+                        $key = ("$($m.UserPrincipalName)").ToLower()
+                        $mbxTypeMap[$key]     = $m.RecipientTypeDetails
+                        $archiveInfoMap[$key] = $archiveInfo
+                    }
+                    if ($m.PrimarySmtpAddress) {
+                        $key = ("$($m.PrimarySmtpAddress)").ToLower()
+                        $mbxTypeMap[$key]     = $m.RecipientTypeDetails
+                        $archiveInfoMap[$key] = $archiveInfo
+                    }
                 }
                 Write-Step "  -> $($exoMailboxes.Count) mailboxes, $($mbxTypeMap.Count) identities mapped" 'OK'
             }
         } catch {
             Write-Step "  -> Exchange Online unavailable: $($_.Exception.Message)" 'WARN'
-            Write-Step "     MailboxType/Delegation/PublicFolders will be limited. Re-run once ExO is reachable." 'WARN'
+            Write-Step "     MailboxType/Delegation/PublicFolders/Archive will be limited. Re-run once ExO is reachable." 'WARN'
         }
     }
 
     $mbx = Invoke-Collection 'Mailbox usage' {
         Get-GraphUsageReport -ReportName 'getMailboxUsageDetail' -Period $UsagePeriod | ForEach-Object {
-            $upn   = $_.'User Principal Name'
-            $mtype = if ($upn -and $mbxTypeMap.ContainsKey(("$upn").ToLower())) { $mbxTypeMap[("$upn").ToLower()] }
-                     elseif ($SkipMailboxType) { 'Unknown (skipped)' } else { 'Unknown' }
+            $upn     = $_.'User Principal Name'
+            $mtype   = if ($upn -and $mbxTypeMap.ContainsKey(("$upn").ToLower())) { $mbxTypeMap[("$upn").ToLower()] }
+                       elseif ($SkipMailboxType) { 'Unknown (skipped)' } else { 'Unknown' }
+            $archive = if ($upn -and $archiveInfoMap.ContainsKey(("$upn").ToLower())) { $archiveInfoMap[("$upn").ToLower()] } else { $null }
             [pscustomobject]@{
                 DisplayName       = $_.'Display Name'
                 UserPrincipalName = $upn
@@ -844,6 +870,9 @@ if ($Workload -contains 'Exchange') {
                 IssueWarningGB    = Format-Gb $_.'Issue Warning Quota (Byte)'
                 ProhibitSendGB    = Format-Gb $_.'Prohibit Send Quota (Byte)'
                 ProhibitSendRecvGB= Format-Gb $_.'Prohibit Send/Receive Quota (Byte)'
+                HasArchive        = if ($archive) { $archive.HasArchive } elseif ($SkipMailboxType) { $null } else { $false }
+                ArchiveStatus     = if ($archive) { $archive.ArchiveStatus } elseif ($SkipMailboxType) { 'Unknown (skipped)' } else { 'None' }
+                AutoExpandingArchive = if ($archive) { $archive.AutoExpandingArchiveEnabled } else { $false }
                 LastActivityDate  = $_.'Last Activity Date'
                 CreatedDate       = $_.'Created Date'
             }
@@ -857,6 +886,53 @@ if ($Workload -contains 'Exchange') {
         Add-Summary '  Equipment mailboxes'  (@($mbx | Where-Object { $_.MailboxType -eq 'EquipmentMailbox' }).Count)
         Add-Summary 'Mailbox storage (GB)'   ([math]::Round((($mbx | Measure-Object UsedGB -Sum).Sum), 2))
         Add-Summary 'Largest mailbox (GB)'   (($mbx | Measure-Object UsedGB -Maximum).Maximum)
+        Add-Summary '  Mailboxes with archive enabled' (@($mbx | Where-Object HasArchive).Count)
+    }
+
+    # Archive mailbox size/item count. Graph's usage-report API only sizes the
+    # primary mailbox, so archive usage needs a per-mailbox Exchange Online call
+    # (Get-EXOMailboxStatistics -Archive) against just the archive-enabled ones.
+    if (-not $SkipArchiveStats -and $script:ExoConnected -and $exoMailboxes.Count) {
+        $archiveMailboxes = @($exoMailboxes | Where-Object { $_.ArchiveStatus -and $_.ArchiveStatus -ne 'None' })
+        if ($archiveMailboxes.Count) {
+            $archiveStats = Invoke-Collection 'Archive mailbox usage' {
+                $rows = [System.Collections.Generic.List[object]]::new()
+                foreach ($m in $archiveMailboxes) {
+                    $id = "$($m.PrimarySmtpAddress)"
+                    try {
+                        $stat = Get-EXOMailboxStatistics -Identity $id -Archive -Properties LastLogonTime -ErrorAction Stop
+                        $sizeGb = 0
+                        if ($stat -and $stat.TotalItemSize) {
+                            try { $sizeGb = Format-Gb $stat.TotalItemSize.Value.ToBytes() } catch { }
+                        }
+                        $rows.Add([pscustomobject]@{
+                            Mailbox                     = $id
+                            DisplayName                 = $m.DisplayName
+                            MailboxType                 = $m.RecipientTypeDetails
+                            ArchiveStatus               = "$($m.ArchiveStatus)"
+                            AutoExpandingArchiveEnabled = [bool]$m.AutoExpandingArchiveEnabled
+                            ArchiveItemCount            = if ($stat) { [int64]$stat.ItemCount } else { 0 }
+                            ArchiveSizeGB               = $sizeGb
+                            ArchiveLastLogonTime        = if ($stat) { $stat.LastLogonTime } else { $null }
+                        })
+                    } catch {
+                        $rows.Add([pscustomobject]@{
+                            Mailbox = $id; DisplayName = $m.DisplayName; MailboxType = $m.RecipientTypeDetails
+                            ArchiveStatus = "$($m.ArchiveStatus)"; AutoExpandingArchiveEnabled = [bool]$m.AutoExpandingArchiveEnabled
+                            ArchiveItemCount = $null; ArchiveSizeGB = $null; ArchiveLastLogonTime = $null
+                        })
+                    }
+                }
+                $rows
+            }
+            $collected['Archive-Mailboxes'] = $archiveStats
+            if ($archiveStats) {
+                Add-Summary 'Archive mailboxes'      $archiveStats.Count
+                Add-Summary 'Archive storage (GB)'   ([math]::Round((($archiveStats | Measure-Object ArchiveSizeGB -Sum).Sum), 2))
+            }
+        } else {
+            Write-Step "Archive mailbox usage: no archive-enabled mailboxes found" 'INFO'
+        }
     }
 
     # Mailbox delegation: FullAccess, SendAs and SendOnBehalf. These do NOT follow
