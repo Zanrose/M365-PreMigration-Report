@@ -102,9 +102,15 @@
 
     The SharePoint-Permissions sheet (Owners/Members/Visitors per site) is not
     available through Microsoft Graph, so it goes over SharePoint REST via the
-    PnP.PowerShell module instead - a separate sign-in from Graph:
+    PnP.PowerShell module instead - a separate sign-in from Graph, first to the
+    tenant's SharePoint admin center (to list every site via
+    Get-PnPTenantSite - deliberately not the usage report's Site URL column
+    above, which has been observed blank for every row on some tenants
+    regardless of the conceal-names setting) and then to each site in turn:
         - Interactive: PnP prompts once (its own multi-tenant app, consented on
           first use) and reuses the cached token for the rest of the sites.
+          The signed-in account needs Global Admin or SharePoint Admin to list
+          the tenant's sites.
         - App-only (-UseAppOnly): the same app registration needs the
           SharePoint "Sites.FullControl.All" *application* permission (admin
           consented) in addition to the Graph permissions above, since Graph
@@ -192,7 +198,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.7.2'
+$ScriptVersion       = '1.8.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -1234,39 +1240,36 @@ if ($Workload -contains 'SharePoint') {
 
     # Site permissions: the Owners / Members / Visitors groups every SharePoint
     # site gets at creation, and who's in each one. Classic site groups aren't
-    # exposed by Microsoft Graph, so this connects to each site individually
-    # over SharePoint REST via PnP.PowerShell - a separate sign-in from Graph
-    # (see .NOTES). One-time connect test against the first site up front so a
-    # missing/declined sign-in warns once and skips the sheet, rather than
-    # failing the same way for every site in the tenant.
+    # exposed by Microsoft Graph, so this connects to the SharePoint admin
+    # center and to each site individually over SharePoint REST via
+    # PnP.PowerShell - a separate sign-in from Graph (see .NOTES).
+    #
+    # The site list comes from Get-PnPTenantSite (the admin center's own
+    # inventory), NOT from the usage report's Site URL column above: that
+    # column has been observed coming back blank for every row on some
+    # tenants regardless of the "conceal names" report setting (confirmed off,
+    # and off long enough that report-change propagation isn't the cause
+    # either) - a Microsoft-side report quirk, not something this script
+    # controls. Get-PnPTenantSite is authoritative and sidesteps it entirely.
     $script:PnPConnected = $false
     if (-not $SkipSharePointPermissions) {
-        # IsDeleted here is the raw usage-report CSV text ("True"/"False"), not a
-        # real boolean - any non-empty string (including the text "False") is
-        # truthy in PowerShell, so comparing it directly as a boolean would
-        # filter out every site, deleted or not. Compare the string instead.
-        $spSites = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -match '^https?://' -and "$($_.IsDeleted)" -ne 'True' })
-        if (-not $spSites.Count) {
-            Write-Step "SharePoint site permissions: no sites to inspect" 'INFO'
-            if ($spo.Count) {
-                $blankUrl = @($spo | Where-Object { -not $_.SiteUrl }).Count
-                $badUrl   = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -notmatch '^https?://' }).Count
-                $deleted  = @($spo | Where-Object { "$($_.IsDeleted)" -eq 'True' }).Count
-                Write-Step "  -> of $($spo.Count) sites: $blankUrl blank SiteUrl, $badUrl non-http(s) SiteUrl, $deleted marked deleted" 'WARN'
-                $sample = $spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -notmatch '^https?://' } | Select-Object -First 1 -ExpandProperty SiteUrl
-                if ($sample) { Write-Step "  -> sample non-http SiteUrl value: '$sample'" 'WARN' }
-            }
+        $initialDomain = if ($org -and $org[0].InitialDomain) { $org[0].InitialDomain }
+                          else { $domains | Where-Object IsInitial | Select-Object -First 1 -ExpandProperty Domain }
+        $spTenant   = if ($TenantId) { $TenantId } elseif ($initialDomain) { $initialDomain } else { $ctx.TenantId }
+        $spAdminUrl = if ($initialDomain -match '^([^.]+)\.onmicrosoft\.com$') { "https://$($Matches[1])-admin.sharepoint.com" } else { $null }
+
+        if (-not $spAdminUrl) {
+            Write-Step "SharePoint site permissions: couldn't determine the tenant's SharePoint admin URL (no initial .onmicrosoft.com domain found); skipping" 'WARN'
         } else {
-            $spTenant = if ($TenantId) { $TenantId } elseif ($org -and $org[0].InitialDomain) { $org[0].InitialDomain } else { $ctx.TenantId }
             try {
                 Initialize-Module -Name 'PnP.PowerShell'
                 Import-Module PnP.PowerShell -ErrorAction Stop
-                Write-Step "Connecting to SharePoint (PnP) for site permissions..." 'INFO'
+                Write-Step "Connecting to SharePoint (PnP) at $spAdminUrl ..." 'INFO'
                 if ($UseAppOnly) {
-                    Connect-PnPOnline -Url $spSites[0].SiteUrl -ClientId $ClientId `
+                    Connect-PnPOnline -Url $spAdminUrl -ClientId $ClientId `
                         -Thumbprint $CertificateThumbprint -Tenant $spTenant -ErrorAction Stop
                 } else {
-                    Connect-PnPOnline -Url $spSites[0].SiteUrl -Interactive -ErrorAction Stop
+                    Connect-PnPOnline -Url $spAdminUrl -Interactive -ErrorAction Stop
                 }
                 $script:PnPConnected = $true
             } catch {
@@ -1274,11 +1277,28 @@ if ($Workload -contains 'SharePoint') {
                 Write-Step "     SharePoint-Permissions sheet will be skipped. Re-run once PnP access is available." 'WARN'
             }
 
+            $spSites = @()
             if ($script:PnPConnected) {
+                try {
+                    # Get-PnPTenantSite excludes OneDrive (personal) sites by default;
+                    # the URL filter below is just a safety net.
+                    $spSites = @(Get-PnPTenantSite -ErrorAction Stop |
+                        Where-Object { $_.Url -and $_.Url -notlike '*-my.sharepoint.com*' } |
+                        Select-Object -ExpandProperty Url)
+                    Write-Step "  -> $($spSites.Count) site(s) in tenant inventory" 'OK'
+                } catch {
+                    Write-Step "  -> Get-PnPTenantSite failed: $($_.Exception.Message)" 'WARN'
+                    Write-Step "     SharePoint-Permissions sheet will be skipped." 'WARN'
+                    $script:PnPConnected = $false
+                }
+            }
+
+            if ($script:PnPConnected -and -not $spSites.Count) {
+                Write-Step "SharePoint site permissions: no sites to inspect" 'INFO'
+            } elseif ($script:PnPConnected) {
                 $spPerms = Invoke-Collection 'SharePoint site permissions (Owners/Members/Visitors)' {
                     $rows = [System.Collections.Generic.List[object]]::new()
-                    foreach ($site in $spSites) {
-                        $siteUrl = $site.SiteUrl
+                    foreach ($siteUrl in $spSites) {
                         $web = $null
                         try {
                             if ($UseAppOnly) {

@@ -3,6 +3,21 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.8.0] - 2026-10-16
+### Changed
+- **SharePoint-Permissions site list now comes from `Get-PnPTenantSite`,
+  not the usage report.** Diagnostics added in 1.7.2 showed a live tenant
+  where every one of 38 sites had a blank `Site URL` in the SharePoint
+  usage report, with "conceal user, group and site names in all reports"
+  confirmed off (and off long enough that propagation delay isn't the
+  cause) - a Microsoft-side report quirk rather than a script bug. The
+  permissions sheet now connects to the tenant's SharePoint admin center
+  and lists sites via `Get-PnPTenantSite` (the admin center's own
+  authoritative inventory) instead of depending on that report column, so
+  it no longer silently comes up empty when that field is blank. The
+  signed-in account needs Global Admin or SharePoint Admin to list sites
+  this way.
+
 ## [1.7.2] - 2026-10-16
 ### Changed
 - **Diagnostics for an empty SharePoint-Permissions sheet.** When no sites
