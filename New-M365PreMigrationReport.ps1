@@ -192,7 +192,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.7.1'
+$ScriptVersion       = '1.7.2'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -1248,6 +1248,14 @@ if ($Workload -contains 'SharePoint') {
         $spSites = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -match '^https?://' -and "$($_.IsDeleted)" -ne 'True' })
         if (-not $spSites.Count) {
             Write-Step "SharePoint site permissions: no sites to inspect" 'INFO'
+            if ($spo.Count) {
+                $blankUrl = @($spo | Where-Object { -not $_.SiteUrl }).Count
+                $badUrl   = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -notmatch '^https?://' }).Count
+                $deleted  = @($spo | Where-Object { "$($_.IsDeleted)" -eq 'True' }).Count
+                Write-Step "  -> of $($spo.Count) sites: $blankUrl blank SiteUrl, $badUrl non-http(s) SiteUrl, $deleted marked deleted" 'WARN'
+                $sample = $spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -notmatch '^https?://' } | Select-Object -First 1 -ExpandProperty SiteUrl
+                if ($sample) { Write-Step "  -> sample non-http SiteUrl value: '$sample'" 'WARN' }
+            }
         } else {
             $spTenant = if ($TenantId) { $TenantId } elseif ($org -and $org[0].InitialDomain) { $org[0].InitialDomain } else { $ctx.TenantId }
             try {

@@ -3,6 +3,16 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.7.2] - 2026-10-16
+### Changed
+- **Diagnostics for an empty SharePoint-Permissions sheet.** When no sites
+  qualify for the permissions sheet, the script now also logs how many of
+  the collected sites have a blank `SiteUrl`, how many have a `SiteUrl` that
+  doesn't start with `http(s)://`, how many are marked deleted, and a sample
+  of the first non-conforming `SiteUrl` value - to tell a concealed-names /
+  reporting-latency issue apart from a real bug without needing to open the
+  workbook first.
+
 ## [1.7.1] - 2026-10-16
 ### Fixed
 - **SharePoint-Permissions sheet always reporting "no sites to inspect".**
