@@ -1241,7 +1241,11 @@ if ($Workload -contains 'SharePoint') {
     # failing the same way for every site in the tenant.
     $script:PnPConnected = $false
     if (-not $SkipSharePointPermissions) {
-        $spSites = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -match '^https?://' -and -not $_.IsDeleted })
+        # IsDeleted here is the raw usage-report CSV text ("True"/"False"), not a
+        # real boolean - any non-empty string (including the text "False") is
+        # truthy in PowerShell, so comparing it directly as a boolean would
+        # filter out every site, deleted or not. Compare the string instead.
+        $spSites = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -match '^https?://' -and "$($_.IsDeleted)" -ne 'True' })
         if (-not $spSites.Count) {
             Write-Step "SharePoint site permissions: no sites to inspect" 'INFO'
         } else {
