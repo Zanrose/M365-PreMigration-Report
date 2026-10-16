@@ -3,6 +3,17 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.7.1] - 2026-10-16
+### Fixed
+- **SharePoint-Permissions sheet always reporting "no sites to inspect".**
+  The site filter checked the usage report's `IsDeleted` field as a boolean,
+  but that field is raw CSV text (`"True"`/`"False"`), and any non-empty
+  string - including the literal text `"False"` - is truthy in PowerShell.
+  That made every site look deleted, filtering all of them out before the
+  PnP loop ran. Confirmed against a live tenant: 38 sites in the SharePoint
+  usage sheet, 0 inspected for permissions. Now compares the string value
+  instead of treating it as a boolean.
+
 ## [1.7.0] - 2026-10-16
 ### Added
 - **SharePoint site permissions.** New `SharePoint-Permissions` sheet listing

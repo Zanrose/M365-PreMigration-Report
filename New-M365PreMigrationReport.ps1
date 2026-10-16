@@ -192,7 +192,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.7.0'
+$ScriptVersion       = '1.7.1'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
