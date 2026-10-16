@@ -3,6 +3,22 @@
 All notable changes to **New-M365PreMigrationReport.ps1** are documented here.
 This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## [1.7.0] - 2026-10-16
+### Added
+- **SharePoint site permissions.** New `SharePoint-Permissions` sheet listing
+  each site's built-in Owners / Members / Visitors groups and their members
+  (name, login name, email, principal type). These classic site groups aren't
+  exposed by Microsoft Graph, so the SharePoint workload now also connects to
+  each site individually over SharePoint REST via `PnP.PowerShell` - a second,
+  separate sign-in from Graph (interactive prompts once and reuses the cached
+  token; app-only reuses `-ClientId`/`-CertificateThumbprint` but also needs
+  the SharePoint `Sites.FullControl.All` *application* permission consented,
+  since Graph app permissions don't carry over to SharePoint REST). A failed
+  or declined PnP sign-in warns once and skips just that sheet rather than
+  failing the run. New `-SkipSharePointPermissions` switch to skip it outright
+  (e.g. tenants with a large number of sites). Summary gains counts for sites
+  with permission data collected and total Owner/Member/Visitor grants.
+
 ## [1.6.0] - 2026-07-23
 ### Added
 - **Archive mailbox detection and usage.** The Mailboxes sheet now flags

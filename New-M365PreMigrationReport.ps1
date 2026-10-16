@@ -11,7 +11,9 @@
         * Identity & licensing  - users, guests, license SKUs, per-user licenses,
                                    MFA / auth-method registration
         * Exchange / mailboxes  - mailbox usage (size, item count, archive)
-        * SharePoint & OneDrive - site storage, per-user OneDrive usage
+        * SharePoint & OneDrive - site storage, per-user OneDrive usage, and each
+                                   site's built-in Owners/Members/Visitors groups
+                                   with their membership
         * Teams & Groups        - M365 groups, Teams, owner/member counts
 
     Each data set is written to its own worksheet, with a "Summary" tab that
@@ -19,8 +21,10 @@
 
     Mailbox / OneDrive / SharePoint sizing comes from the Graph **usage reports**
     API (getMailboxUsageDetail, getOneDriveUsageAccountDetail,
-    getSharePointSiteUsageDetail). This keeps the whole script on the Graph SDK
-    (no Exchange Online module required).
+    getSharePointSiteUsageDetail). This keeps most of the script on the Graph
+    SDK; the Exchange and SharePoint workloads each also make a second,
+    workload-specific connection (Exchange Online, and SharePoint via
+    PnP.PowerShell respectively) for data Graph doesn't expose.
 
 .PARAMETER OutputPath
     Folder or full .xlsx path for the report. Defaults to the script folder with
@@ -67,6 +71,13 @@
     Don't write a transcript log file. By default the full console output of the
     run is also written to a timestamped .log file next to the script.
 
+.PARAMETER SkipSharePointPermissions
+    Skip the SharePoint-Permissions sheet (each site's built-in Owners / Members
+    / Visitors groups and their membership). This connects to every SharePoint
+    site individually over SharePoint REST via PnP.PowerShell, which is a
+    separate sign-in from Graph (see .NOTES), so skip it on tenants with a large
+    number of sites or where that extra sign-in isn't available.
+
 .EXAMPLE
     .\New-M365PreMigrationReport.ps1
     Interactive sign-in, all workloads, report dropped next to the script.
@@ -88,6 +99,19 @@
     "Reports: Display concealed user, group and site names" turned ON in
     M365 admin center > Settings > Org settings > Reports. Turn it off (or accept
     GUIDs) before running for full detail.
+
+    The SharePoint-Permissions sheet (Owners/Members/Visitors per site) is not
+    available through Microsoft Graph, so it goes over SharePoint REST via the
+    PnP.PowerShell module instead - a separate sign-in from Graph:
+        - Interactive: PnP prompts once (its own multi-tenant app, consented on
+          first use) and reuses the cached token for the rest of the sites.
+        - App-only (-UseAppOnly): the same app registration needs the
+          SharePoint "Sites.FullControl.All" *application* permission (admin
+          consented) in addition to the Graph permissions above, since Graph
+          app permissions don't carry over to SharePoint REST.
+    If that sign-in isn't available, the sheet is skipped with a warning and
+    the rest of the report still runs; use -SkipSharePointPermissions to skip
+    it outright (e.g. on tenants with a large number of sites).
 #>
 [CmdletBinding()]
 param(
@@ -138,6 +162,13 @@ param(
     # trees to skip just that sheet while still getting the folder inventory.
     [switch]$SkipPublicFolderPermissions,
 
+    # SharePoint site permissions (Owners/Members/Visitors groups + membership)
+    # aren't exposed by Graph, so this connects to every site individually over
+    # SharePoint REST via PnP.PowerShell - a separate sign-in from Graph. Use
+    # -SkipSharePointPermissions to skip that sheet (e.g. many sites, or that
+    # sign-in isn't available) while still getting the SharePoint usage sheet.
+    [switch]$SkipSharePointPermissions,
+
     # License friendly-name catalog. By default the script downloads Microsoft's
     # published "Product names and service plan identifiers" CSV. Use
     # -OfflineSkuNames to skip the download (built-in map only), or -SkuCatalogPath
@@ -161,7 +192,7 @@ $script:StartTime = Get-Date
 
 # Version + self-update source. Keep the $ScriptVersion line in this exact format;
 # the updater parses it out of the remote copy to detect newer releases.
-$ScriptVersion       = '1.6.0'
+$ScriptVersion       = '1.7.0'
 $script:RepoOwner    = 'Zanrose'
 $script:RepoName     = 'M365-PreMigration-Report'
 $script:RepoBranch   = 'main'
@@ -609,7 +640,9 @@ if ($org) {
 
 # Now that we know the tenant, build the filename: <Tenant>-PreMigration-<date>.xlsx
 # Prefer the org display name; fall back to the initial onmicrosoft.com prefix,
-# then the default domain prefix, then the tenant id.
+# then the default domain prefix, then the signed-in account's email domain,
+# then the raw tenant id (e.g. if /organization itself came back Forbidden, so
+# $org is empty — a permissions/consent gap, not a script bug).
 if (-not $script:OutputFile) {
     $tenantLabel = $null
     if ($org) {
@@ -617,8 +650,10 @@ if (-not $script:OutputFile) {
         if ([string]::IsNullOrWhiteSpace($tenantLabel)) {
             if     ($org[0].InitialDomain) { $tenantLabel = ($org[0].InitialDomain -split '\.')[0] }
             elseif ($org[0].DefaultDomain) { $tenantLabel = ($org[0].DefaultDomain -split '\.')[0] }
-            elseif ($org[0].TenantId)      { $tenantLabel = $org[0].TenantId }
         }
+    }
+    if ([string]::IsNullOrWhiteSpace($tenantLabel) -and $ctx.Account -and $ctx.Account -match '@([^@]+)$') {
+        $tenantLabel = ($Matches[1] -split '\.')[0]
     }
     if ([string]::IsNullOrWhiteSpace($tenantLabel)) { $tenantLabel = $ctx.TenantId }
     if ([string]::IsNullOrWhiteSpace($tenantLabel)) { $tenantLabel = 'M365' }
@@ -682,7 +717,7 @@ if ($Workload -contains 'Identity') {
     if ($skus) { Add-Summary 'Licensed seats assigned' (($skus | Measure-Object Assigned -Sum).Sum) }
 
     $users = Invoke-Collection 'Users' {
-        $select = 'id,displayName,userPrincipalName,mail,userType,accountEnabled,createdDateTime,assignedLicenses,onPremisesSyncEnabled,usageLocation,department,jobTitle'
+        $select = 'id,displayName,userPrincipalName,mail,userType,accountEnabled,createdDateTime,assignedLicenses,onPremisesSyncEnabled,usageLocation,department,jobTitle,proxyAddresses'
         $uri = "https://graph.microsoft.com/v1.0/users?`$select=$select&`$top=999"
         $all = [System.Collections.Generic.List[object]]::new()
         do {
@@ -706,6 +741,7 @@ if ($Workload -contains 'Identity') {
                     JobTitle           = $u.jobTitle
                     LicenseCount       = @($u.assignedLicenses).Count
                     Licenses           = ($licNames -join '; ')
+                    ProxyAddresses     = ($u.proxyAddresses -join '; ')
                     CreatedDateTime    = $u.createdDateTime
                 })
             }
@@ -1194,6 +1230,104 @@ if ($Workload -contains 'SharePoint') {
     if ($od) {
         Add-Summary 'OneDrive accounts'     $od.Count
         Add-Summary 'OneDrive storage (GB)' ([math]::Round((($od | Measure-Object StorageUsedGB -Sum).Sum), 2))
+    }
+
+    # Site permissions: the Owners / Members / Visitors groups every SharePoint
+    # site gets at creation, and who's in each one. Classic site groups aren't
+    # exposed by Microsoft Graph, so this connects to each site individually
+    # over SharePoint REST via PnP.PowerShell - a separate sign-in from Graph
+    # (see .NOTES). One-time connect test against the first site up front so a
+    # missing/declined sign-in warns once and skips the sheet, rather than
+    # failing the same way for every site in the tenant.
+    $script:PnPConnected = $false
+    if (-not $SkipSharePointPermissions) {
+        $spSites = @($spo | Where-Object { $_.SiteUrl -and $_.SiteUrl -match '^https?://' -and -not $_.IsDeleted })
+        if (-not $spSites.Count) {
+            Write-Step "SharePoint site permissions: no sites to inspect" 'INFO'
+        } else {
+            $spTenant = if ($TenantId) { $TenantId } elseif ($org -and $org[0].InitialDomain) { $org[0].InitialDomain } else { $ctx.TenantId }
+            try {
+                Initialize-Module -Name 'PnP.PowerShell'
+                Import-Module PnP.PowerShell -ErrorAction Stop
+                Write-Step "Connecting to SharePoint (PnP) for site permissions..." 'INFO'
+                if ($UseAppOnly) {
+                    Connect-PnPOnline -Url $spSites[0].SiteUrl -ClientId $ClientId `
+                        -Thumbprint $CertificateThumbprint -Tenant $spTenant -ErrorAction Stop
+                } else {
+                    Connect-PnPOnline -Url $spSites[0].SiteUrl -Interactive -ErrorAction Stop
+                }
+                $script:PnPConnected = $true
+            } catch {
+                Write-Step "  -> SharePoint (PnP) unavailable: $($_.Exception.Message)" 'WARN'
+                Write-Step "     SharePoint-Permissions sheet will be skipped. Re-run once PnP access is available." 'WARN'
+            }
+
+            if ($script:PnPConnected) {
+                $spPerms = Invoke-Collection 'SharePoint site permissions (Owners/Members/Visitors)' {
+                    $rows = [System.Collections.Generic.List[object]]::new()
+                    foreach ($site in $spSites) {
+                        $siteUrl = $site.SiteUrl
+                        $web = $null
+                        try {
+                            if ($UseAppOnly) {
+                                Connect-PnPOnline -Url $siteUrl -ClientId $ClientId `
+                                    -Thumbprint $CertificateThumbprint -Tenant $spTenant -ErrorAction Stop
+                            } else {
+                                Connect-PnPOnline -Url $siteUrl -Interactive -ErrorAction Stop
+                            }
+                            $web = Get-PnPWeb -Includes AssociatedOwnerGroup, AssociatedMemberGroup, AssociatedVisitorGroup -ErrorAction Stop
+                        } catch {
+                            $rows.Add([pscustomobject]@{
+                                SiteUrl = $siteUrl; Role = $null; GroupName = $null
+                                MemberName = $null; MemberLoginName = $null; MemberEmail = $null; MemberType = $null
+                                Note = "Connect/read failed: $($_.Exception.Message)"
+                            })
+                            continue
+                        }
+                        $groupDefs = @(
+                            @{ Role = 'Owner';   Group = $web.AssociatedOwnerGroup }
+                            @{ Role = 'Member';  Group = $web.AssociatedMemberGroup }
+                            @{ Role = 'Visitor'; Group = $web.AssociatedVisitorGroup }
+                        )
+                        foreach ($gd in $groupDefs) {
+                            $grp = $gd.Group
+                            if (-not $grp -or -not $grp.Id) { continue }   # group not provisioned on this site
+                            $members = @()
+                            try { $members = @(Get-PnPGroupMember -Identity $grp.Id -ErrorAction Stop) } catch { }
+                            if (-not $members.Count) {
+                                $rows.Add([pscustomobject]@{
+                                    SiteUrl = $siteUrl; Role = $gd.Role; GroupName = $grp.Title
+                                    MemberName = $null; MemberLoginName = $null; MemberEmail = $null; MemberType = $null
+                                    Note = 'No members'
+                                })
+                                continue
+                            }
+                            foreach ($m in $members) {
+                                $rows.Add([pscustomobject]@{
+                                    SiteUrl         = $siteUrl
+                                    Role            = $gd.Role
+                                    GroupName       = $grp.Title
+                                    MemberName      = $m.Title
+                                    MemberLoginName = $m.LoginName
+                                    MemberEmail     = $m.Email
+                                    MemberType      = "$($m.PrincipalType)"
+                                    Note            = $null
+                                })
+                            }
+                        }
+                    }
+                    $rows
+                }
+                $collected['SharePoint-Permissions'] = $spPerms
+                if ($spPerms) {
+                    $sitesWithData = @($spPerms | Where-Object Role | Select-Object -ExpandProperty SiteUrl -Unique)
+                    $memberGrants  = @($spPerms | Where-Object { $_.Role -and -not $_.Note })
+                    Add-Summary 'SharePoint sites with Owner/Member/Visitor data' $sitesWithData.Count
+                    Add-Summary 'SharePoint Owner/Member/Visitor grants'         $memberGrants.Count
+                }
+                try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch { }
+            }
+        }
     }
 }
 
